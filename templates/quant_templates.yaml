@@ -1,0 +1,72 @@
+# Quantization template lookup table.
+# For each model architecture, list one or more entries matched first to last.
+#   hidden_size: -1  → match any hidden size
+#   num_hidden_layers: -1 → match any number of layers
+# Architecture key "*" matches any unsupported architecture.
+#
+# Per-scheme fields:
+#   template: path to a quantization template script (optional)
+#   ignore:   comma-separated layer names/regex patterns to skip quantization (optional)
+#             Priority: CLI --ignore > YAML ignore > hardcoded default in llmc_oneshot
+#   quant_type: type hint for the template script (optional)
+#
+# A scheme without "template" only provides overrides (e.g. ignore) for the generic path.
+
+Qwen2ForCausalLM:
+  - hidden_size: 896
+    num_hidden_layers: 24
+    schemes:
+      FP8_DYNAMIC:
+        ignore: "lm_head"  # Specify ignore for Qwen2.5-0.5B FP8_DYNAMIC
+
+Qwen3ForCausalLM:
+  - hidden_size: 2048
+    num_hidden_layers: 28
+    schemes:
+      W8A8:
+        template: "templates/qwen3_1.7b_quant.py"
+
+DeepseekV3ForCausalLM:
+  - hidden_size: -1
+    num_hidden_layers: -1
+    schemes:
+      DeepseekV3_FP8_TO_INT8:
+        template: "templates/w8a8_block_cast_channel.py"
+        quant_type: "int8"
+      DeepseekV3_FP8_TO_FP8:
+        template: "templates/w8a8_block_cast_channel.py"
+        quant_type: "fp8"
+
+Qwen3_5MoeForConditionalGeneration:
+  - hidden_size: -1
+    num_hidden_layers: -1
+    schemes:
+      Qwen35_MOE_BF16_TO_INT8:
+        template: "templates/qwen3_5_bf16_to_channel.py"
+        quant_type: "int8"
+
+"*":
+  - hidden_size: -1
+    num_hidden_layers: -1
+    schemes:
+      FP8_TO_BF16:
+        template: "templates/fp8_to_bf16.py"
+
+MiniMaxM2ForCausalLM:
+  - hidden_size: 3072
+    num_hidden_layers: 62 # MiniMax-M2.5/MiniMax-M2.7
+    schemes:
+      FP8_DYNAMIC:
+        ignore: "lm_head,re:.*moe.gate$,re:.*moe.e_score_correction_bias$"
+
+KimiK25ForConditionalGeneration:
+  - hidden_size: -1
+    num_hidden_layers: -1
+    schemes:
+      Kimi_W4_TO_INT8:
+        template: "templates/w4_dequant_channel.py"
+        quant_type: "int8"
+      Kimi_W4_TO_FP8:
+        template: "templates/w4_dequant_channel.py"
+        quant_type: "fp8"
+
