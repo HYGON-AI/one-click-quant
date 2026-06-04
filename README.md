@@ -187,7 +187,7 @@ python3 main.py --lm-eval "pretrained=/models/Qwen2.5-0.5B-Instruct-FP8_DYNAMIC,
 
 # 精度调优
 
-当PPL精度不符合期望时，需要做离群通道和敏感层分析，优化ignore参数。
+当PPL精度不符合期望时，需要做敏感层分析，优化ignore参数。
 
 目前的分析功能还处于初级阶段，仅供参考。
 
