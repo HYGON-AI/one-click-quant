@@ -46,8 +46,8 @@ pip install lm_eval[vllm,api]
 
 ```bash
 # 下载one_click_quant代码工程
-git clone http://42.228.13.241:10068/dcutoolkit/deeplearing/llm-compressor.git
-cd llm-compressor/examples/one_click_quant
+git clone https://developer.sourcefind.cn/codes/OpenDAS/one_click_quant.git
+cd one_click_quant
 # 下载量化校准数据集，并软链接到当前目录的datasets/ultrachat_200k
 modelscope download --dataset HuggingFaceH4/ultrachat_200k
 ln -s /root/.cache/modelscope/hub/datasets/HuggingFaceH4/ultrachat_200k datasets/ultrachat_200k
