@@ -48,9 +48,8 @@ pip install lm_eval[vllm,api]
 # 下载one_click_quant代码工程
 git clone https://developer.sourcefind.cn/codes/OpenDAS/one_click_quant.git
 cd one_click_quant
-# 下载量化校准数据集，并软链接到当前目录的datasets/ultrachat_200k
-modelscope download --dataset HuggingFaceH4/ultrachat_200k
-ln -s /root/.cache/modelscope/hub/datasets/HuggingFaceH4/ultrachat_200k datasets/ultrachat_200k
+# 下载量化校准数据集
+modelscope download --dataset HuggingFaceH4/ultrachat_200k --local_dir datasets/ultrachat_200k
 ```
 
 > 如果已经有下载好的数据集，可以直接软链接，或者测试时通过\-\-dataset指定数据集文件夹路径。
