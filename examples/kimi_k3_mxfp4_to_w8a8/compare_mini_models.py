@@ -116,6 +116,16 @@ def compare_models(
         max_diff = (out_a - out_b).abs().max().item()
         print(f"  最大绝对差异:    {max_diff:.6e}")
 
+        # Top-K 重叠率（预测 token 一致性）
+        for k in (1, 5, 10):
+            topk_a = out_a.topk(k, dim=-1).indices
+            topk_b = out_b.topk(k, dim=-1).indices
+            overlap = 0
+            for t in range(topk_a.shape[1]):
+                overlap += len(set(topk_a[0, t].tolist()) & set(topk_b[0, t].tolist()))
+            total = k * topk_a.shape[1]
+            print(f"  Top-{k:2d} 重叠率:      {overlap}/{total} ({100*overlap/total:.1f}%)")
+
 
 def main():
     parser = argparse.ArgumentParser(
