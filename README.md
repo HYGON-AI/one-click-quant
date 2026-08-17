@@ -387,7 +387,7 @@ pip install -i https://mirrors.aliyun.com/pypi/simple -e .
 
 2. 如果不是调用llmc实现的模型量化，参考其他例子，把自己的python代码集成到文件夹templates即可。
 
-# 常见故障排查 (Trouble shooting)
+# 常见故障排查
 
 - 量化过程中遇到"CUDA out of memory"，如何解决？
 
