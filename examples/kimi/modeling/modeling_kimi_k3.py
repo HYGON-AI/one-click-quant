@@ -31,6 +31,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformers
+from packaging import version
 from transformers import activations
 
 try:
@@ -942,8 +944,14 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
     def get_decoder(self):
         return self.language_model.get_decoder()
 
-    def tie_weights(self, **kwargs):
-        return self.language_model.tie_weights(**kwargs)
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        # transformers >= 5.2 的 tie_weights 新增了 missing_keys / recompute_mapping 参数，
+        # 显式按版本选择调用方式：新版转发参数，旧版无参调用
+        if version.parse(transformers.__version__) >= version.parse("5.2.0"):
+            return self.language_model.tie_weights(
+                missing_keys=missing_keys, recompute_mapping=recompute_mapping
+            )
+        return self.language_model.tie_weights()
 
     def resize_token_embeddings(self,
                                 new_num_tokens: int | None = None,

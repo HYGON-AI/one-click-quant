@@ -41,10 +41,12 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+
 try:
     from transformers.utils.generic import OutputRecorder, check_model_inputs
 except ImportError:
-    from transformers.utils.output_capturing import OutputRecorder  # transformers >= 5.2
+    # transformers >= 5.2 将 OutputRecorder 移到了 utils.output_capturing
+    from transformers.utils.output_capturing import OutputRecorder
     from transformers.utils.generic import check_model_inputs
 
 try:
@@ -1113,14 +1115,24 @@ class KimiLinearModel(KimiPreTrainedModel):
             self.output_attn_res_proj = nn.Linear(
                 config.hidden_size, 1, bias=False)
 
-        if getattr(config, "_attn_implementation", None) is not None:
-            if config._attn_implementation != "flash_attention_2":
-                logger.warning_once(
-                    f"Ignoring the provided attention implementation {config._attn_implementation}")
-                logger.warning_once("Using flash_attention_2 backend instead.")
-                config._attn_implementation = "flash_attention_2"
-        else:
-            config._attn_implementation = "flash_attention_2"
+        # ── Attention implementation 选择 ──
+        # 原逻辑强制 flash_attention_2 (已注释掉):
+        #   if getattr(config, "_attn_implementation", None) is not None:
+        #       if config._attn_implementation != "flash_attention_2":
+        #           logger.warning_once(
+        #               f"Ignoring the provided attention implementation {config._attn_implementation}")
+        #           logger.warning_once("Using flash_attention_2 backend instead.")
+        #           config._attn_implementation = "flash_attention_2"
+        #   else:
+        #       config._attn_implementation = "flash_attention_2"
+        #
+        # 改为默认 eager attention (不依赖 flash_attn / kernels 包):
+        # transformers 5.14+ 的 flash_attention_2 会触发 hub kernel 动态下载
+        # (kernels-community/flash-attn2) 和 publisher trust 检查, 在无网/内网
+        # 环境下会报错. eager attention 纯 PyTorch 实现, 精度与 flash_attention_2
+        # 数值一致, 性能略低但足够 mini 模型对拍验证.
+        if getattr(config, "_attn_implementation", None) is None:
+            config._attn_implementation = "eager"
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
