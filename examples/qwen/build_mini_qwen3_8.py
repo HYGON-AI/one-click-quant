@@ -6,6 +6,8 @@
   - 适配 Qwen3.8 张量命名：model.layers.N.* / model.layers.N.mlp.experts.E.*
   - 同时支持 Qwen3.8 FP8 block wise：weight + weight_scale_inv → BF16
   - 同时支持 FP8_DYNAMIC / channel wise：weight + weight_scale → BF16
+  - 支持 MoE-Quant pack_quantized_model.py 产出的 compressed-tensors W4A16：
+    weight_packed + weight_shape + weight_scale → BF16
   - 支持按层、按 expert 子集裁剪，并把保留层重映射为连续的 model.layers.0..N-1
   - 输出默认是纯 BF16 checkpoint，因此会移除 quantization_config
 
@@ -172,14 +174,27 @@ def dequant_fp8_channel(
     return (weight.to(torch.float32) * scale).to(dtype).contiguous()
 
 
-def detect_fp8_format(src_format: str, src_weight_map: dict[str, str]) -> str:
-    """把 fp8/auto 解析成 fp8-block 或 fp8-channel。"""
-    if src_format in {"fp8-block", "fp8-channel", "bf16"}:
+def detect_src_format(src_format: str, src_weight_map: dict[str, str]) -> str:
+    """把 auto 解析成 w4a16 / fp8-block / fp8-channel / bf16。"""
+    if src_format in {"fp8-block", "fp8-channel", "w4a16", "bf16"}:
         return src_format
-    if src_format not in {"fp8", "auto"}:
+    if src_format not in {"auto", "fp8"}:
         raise ValueError(f"不支持的 src_format: {src_format}")
 
     names = src_weight_map.keys()
+    # 优先识别 pack_quantized_model.py 的 W4A16：同一模块必须同时有
+    # weight_packed、weight_scale、weight_shape，避免误把其他 packed 格式识别成 W4A16。
+    packed_bases = {
+        name.removesuffix(".weight_packed")
+        for name in names
+        if name.endswith(".weight_packed")
+    }
+    if any(
+        f"{base}.weight_scale" in src_weight_map
+        and f"{base}.weight_shape" in src_weight_map
+        for base in packed_bases
+    ):
+        return "w4a16"
     if any(name.endswith(".weight_scale_inv") for name in names):
         return "fp8-block"
     if any(name.endswith(".weight_scale") for name in names):
@@ -187,20 +202,69 @@ def detect_fp8_format(src_format: str, src_weight_map: dict[str, str]) -> str:
     return "bf16"
 
 
-def qparam_name_for_weight(name: str, resolved_format: str) -> str | None:
-    if resolved_format == "fp8-block":
-        return name.replace(".weight", ".weight_scale_inv")
-    if resolved_format == "fp8-channel":
-        return name.replace(".weight", ".weight_scale")
-    return None
+def unpack_int4_from_int32(packed: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """compressed-tensors int32-packed INT4 → signed int8 (-8..7)。
+
+    pack_to_int32 打包前会对每个 int4 值 + 8（offset = 1 << (bits-1)）转成无符号
+    范围存储，因此这里 `(nibble & 0xF) - 8` 还原为有符号 int4。
+    """
+    import torch
+
+    if packed.dtype != torch.int32:
+        packed = packed.to(torch.int32)
+    shifts = torch.arange(0, 32, 4, device=packed.device, dtype=torch.int32)
+    values = ((packed.reshape(-1).unsqueeze(-1) >> shifts) & 0xF).to(torch.int8) - 8
+    return values.reshape(rows, -1)[:, :cols]
 
 
-def is_aux_quant_tensor(name: str, resolved_format: str) -> bool:
-    if resolved_format == "fp8-block":
-        return name.endswith(".weight_scale_inv")
-    if resolved_format == "fp8-channel":
-        return name.endswith(".weight_scale")
-    return False
+def dequant_w4a16_packed(name: str, tensors: dict) -> torch.Tensor:
+    """MoE-Quant compressed-tensors W4A16：weight_packed + weight_scale + weight_shape → BF16。
+
+    MoE-Quant 对称量化时 qzero=8，pack_weight 里 qweight_shifted = qweight - zero，
+    因此解包得到的有符号 int4 直接乘 scale 即还原权重。
+    """
+    import torch
+
+    base = name.removesuffix(".weight_packed")
+    scale_name = f"{base}.weight_scale"
+    shape_name = f"{base}.weight_shape"
+    if scale_name not in tensors or shape_name not in tensors:
+        raise ValueError(f"W4A16 tensor {name} 缺少 {scale_name} 或 {shape_name}")
+
+    packed = tensors[name]
+    scale = tensors[scale_name]
+    shape = tensors[shape_name]
+    if packed.dtype != torch.int32:
+        raise ValueError(f"W4A16 weight_packed 必须为 int32，{name} 实际为 {packed.dtype}")
+    if shape.numel() != 2:
+        raise ValueError(
+            f"W4A16 weight_shape 必须包含 [out_features, in_features]，{name} 实际为 {tuple(shape.shape)}"
+        )
+
+    rows, cols = (int(shape[0].item()), int(shape[1].item()))
+    if packed.shape[0] != rows:
+        raise ValueError(f"W4A16 out_features 不一致：{name} packed={packed.shape[0]}, shape={rows}")
+    if scale.dim() != 2 or scale.shape[0] != rows:
+        raise ValueError(f"W4A16 weight_scale shape 非法：{name} 得到 {tuple(scale.shape)}")
+    num_groups = scale.shape[1]
+    if cols % num_groups != 0:
+        raise ValueError(f"W4A16 in_features={cols} 不能被 scale groups={num_groups} 整除：{name}")
+
+    group_size = cols // num_groups
+    unpacked = unpack_int4_from_int32(packed, rows, cols).to(torch.float32)
+    dequant = unpacked.reshape(rows, num_groups, group_size) * scale.to(torch.float32).unsqueeze(-1)
+    return dequant.reshape(rows, cols).to(torch.bfloat16).contiguous()
+
+
+def is_aux_quant_tensor(name: str) -> bool:
+    """量化辅助张量（FP8 / W4A16 的 scale、shape、zero_point 等），解量化输出时不保留。"""
+    return name.endswith((
+        ".weight_scale_inv",
+        ".weight_scale",
+        ".weight_shape",
+        ".weight_packed",
+        ".weight_zero_point",
+    ))
 
 
 def maybe_slice_gate(name: str, tensor: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -344,7 +408,7 @@ def build_mini_model(
     with open(index_path, encoding="utf-8") as f:
         src_index = json.load(f)
     src_weight_map: dict[str, str] = src_index.get("weight_map", {})
-    resolved_src_format = detect_fp8_format(src_format, src_weight_map)
+    resolved_src_format = detect_src_format(src_format, src_weight_map)
 
     print(f"源模型张量: {len(src_weight_map)}")
     print(f"源格式: {src_format} -> {resolved_src_format}")
@@ -374,33 +438,42 @@ def build_mini_model(
 
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    # FP8 权重的 qparam 可能跨 shard，先预收集需要的 scale / scale_inv。
-    scale_cache: dict[str, torch.Tensor] = {}
-    scale_files = set()
-    if resolved_src_format in {"fp8-block", "fp8-channel"} and not keep_quant:
-        needed_scales = {
-            scale_name
-            for tensor_names in files_to_tensors.values()
-            for name in tensor_names
-            if name.endswith(".weight")
-            for scale_name in [qparam_name_for_weight(name, resolved_src_format)]
-            if scale_name is not None
-        }
-        for scale_name in needed_scales:
-            fname = src_weight_map.get(scale_name)
+    # 量化辅助张量可能跨 shard，先预收集需要的 qparam（FP8 scale / W4A16 scale+shape+zero_point）。
+    qparam_cache: dict[str, torch.Tensor] = {}
+    qparam_files = set()
+    if not keep_quant:
+        needed_qparams = set()
+        for tensor_names in files_to_tensors.values():
+            for name in tensor_names:
+                if name.endswith(".weight"):
+                    needed_qparams.update(
+                        q for q in (f"{name}_scale_inv", f"{name}_scale") if q in src_weight_map
+                    )
+                elif name.endswith(".weight_packed"):
+                    base = name.removesuffix(".weight_packed")
+                    needed_qparams.update(
+                        q
+                        for q in (
+                            f"{base}.weight_scale",
+                            f"{base}.weight_shape",
+                            f"{base}.weight_zero_point",
+                        )
+                        if q in src_weight_map
+                    )
+        for qparam_name in needed_qparams:
+            fname = src_weight_map.get(qparam_name)
             if fname is not None:
-                scale_files.add(fname)
-        qparam_desc = "weight_scale_inv" if resolved_src_format == "fp8-block" else "weight_scale"
-        for fname in tqdm(sorted(scale_files), desc=f"预收集 {qparam_desc}"):
+                qparam_files.add(fname)
+        for fname in tqdm(sorted(qparam_files), desc="预收集 qparam"):
             fpath = src_dir / fname
             if not fpath.exists():
-                print(f"  ⚠ 跳过不存在的 scale shard: {fpath}")
+                print(f"  ⚠ 跳过不存在的 qparam shard: {fpath}")
                 continue
             local = load_file(str(fpath))
             for name in local.keys():
-                if name in needed_scales:
-                    scale_cache[name] = local[name]
-    print(f"  预收集 qparam: {len(scale_cache)} 个")
+                if name in needed_qparams:
+                    qparam_cache[name] = local[name]
+    print(f"  预收集 qparam: {len(qparam_cache)} 个")
 
     all_new: dict[str, torch.Tensor] = {}
     new_weight_map: dict[str, str] = {}
@@ -413,10 +486,12 @@ def build_mini_model(
             continue
 
         tensors = load_file(str(fpath))
+        tensors_for_lookup = dict(qparam_cache)
+        tensors_for_lookup.update(tensors)
         for name in tensor_names:
             tensor = tensors[name]
 
-            # keep_quant 时直接透传，包括 weight_scale_inv。
+            # keep_quant 时直接透传，包括 weight_scale_inv / weight_packed / weight_shape / weight_zero_point。
             if keep_quant:
                 key = remap_layer_name(name)
                 tensor = maybe_slice_gate(name, tensor, num_experts)
@@ -425,17 +500,15 @@ def build_mini_model(
                 new_weight_map[key] = "model.safetensors"
                 continue
 
-            # FP8 block / FP8_DYNAMIC 权重 → BF16。只有存在对应 qparam 的 FP8 weight 会进入此分支。
-            if resolved_src_format in {"fp8-block", "fp8-channel"} and name.endswith(".weight") and needs_dequant(tensor):
-                qparam_name = qparam_name_for_weight(name, resolved_src_format)
-                scale = tensors.get(qparam_name)
-                if scale is None:
-                    scale = scale_cache.get(qparam_name)
-                if scale is None:
-                    raise ValueError(f"缺少 {qparam_name}，无法解量化 {name}")
-                if resolved_src_format == "fp8-block":
-                    deq = dequant_fp8_block(tensor, scale)
+            # FP8 权重 → BF16（可能来自源 FP8 模型，或 W4A16 打包模型中 MTP 的原样转存）。
+            if name.endswith(".weight") and needs_dequant(tensor):
+                scale_inv = tensors_for_lookup.get(f"{name}_scale_inv")
+                if scale_inv is not None:
+                    deq = dequant_fp8_block(tensor, scale_inv)
                 else:
+                    scale = tensors_for_lookup.get(f"{name}_scale")
+                    if scale is None:
+                        raise ValueError(f"缺少 {name}_scale_inv 或 {name}_scale，无法解量化 {name}")
                     deq = dequant_fp8_channel(tensor, scale)
                 key = remap_layer_name(name)
                 all_new[key] = deq
@@ -443,11 +516,20 @@ def build_mini_model(
                 new_weight_map[key] = "model.safetensors"
                 continue
 
-            # 解量化输出时不保存 qparam。
-            if is_aux_quant_tensor(name, resolved_src_format):
+            # W4A16 packed 权重 → BF16（MoE-Quant pack_quantized_model.py 输出）。
+            if name.endswith(".weight_packed"):
+                deq = dequant_w4a16_packed(name, tensors_for_lookup)
+                key = remap_layer_name(f"{name.removesuffix('.weight_packed')}.weight")
+                all_new[key] = deq
+                total_size += deq.numel() * deq.element_size()
+                new_weight_map[key] = "model.safetensors"
                 continue
 
-            # BF16 / 非 FP8 普通 tensor 透传，router gate 按 expert 数裁剪。
+            # 解量化输出时不保存量化辅助张量。
+            if is_aux_quant_tensor(name):
+                continue
+
+            # BF16 / 非 FP8 / 非 W4A16 普通 tensor 透传，router gate 按 expert 数裁剪。
             tensor = maybe_slice_gate(name, tensor, num_experts)
             key = remap_layer_name(name)
             all_new[key] = tensor
@@ -483,12 +565,12 @@ def build_mini_model(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="构建 Qwen3.8 mini 模型（支持 FP8 block/channel → BF16）",
+        description="构建 Qwen3.8 mini 模型（支持 FP8 block/channel / W4A16 → BF16）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--src", type=str, default="/models/Qwen3.8-2.4T-A95B-FP8", help="源模型目录")
     parser.add_argument("--dst", type=str, default="/models/Qwen3.8-2.4T-A95B-FP8-Mini", help="输出目录")
-    parser.add_argument("--src-format", choices=["auto", "fp8", "fp8-block", "fp8-channel", "bf16"], default="auto", help="源模型格式；auto 会自动识别 fp8-block / fp8-channel")
+    parser.add_argument("--src-format", choices=["auto", "fp8", "fp8-block", "fp8-channel", "w4a16", "bf16"], default="auto", help="源模型格式；auto 会优先识别 w4a16，再识别 fp8-block / fp8-channel / bf16")
     parser.add_argument("-n", "--num-layers", type=int, default=None, help="保留前 N 层；默认 4")
     parser.add_argument("--layer-range", type=str, default=None, help="截取源层区间 START:END，例 40:44")
     parser.add_argument("--layer-ids", type=str, default=None, help="显式指定源层号，逗号分隔，例 0,3,7")
