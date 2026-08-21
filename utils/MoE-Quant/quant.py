@@ -17,6 +17,7 @@ except:
 
 
 from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
+from src.models import qwen3_5_moe_utils
 
 
 ROUTED_EXPERTS_REGEX = r".*mlp\.experts\.\d+\.(down|gate|up)_proj"
@@ -118,37 +119,47 @@ def main():
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     # Sanity check
-    assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
+    # assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.ep_size = world_size
 
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=dtype
+            config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=dtype       # eager, sdpa
         ).eval()
         model.config.use_cache = False
+        if getattr(config, "model_type", None) == "qwen3_5_moe_text":
+            qwen3_5_moe_utils.prepare_qwen3_5_moe_model(model, config, dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
     # Prepare calibration dataset
+    print(f"Preparing calibration dataset...")
     calibration_dataset = data_utils.prepare_calibration_dataset(
         args.dataset_name_or_path, tokenizer, args.max_sequence_length, args.num_calibration_samples, args.seed
     )
+    print(f"Calibration dataset prepared, {len(calibration_dataset)} sequences.")
 
     # Take slices (if running on multiple workers)
     num_seq_per_rank = len(calibration_dataset) // world_size
     calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
     dist_utils.barrier(device_ids=[rank])
 
-    # Load initial weight shard
+    # Load safetensors index and the input embedding shard on rank 0.
     weight_dir = args.model_name_or_path
-    current_shard_id = 1
-    weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
-
     param_buffer = {}
     if dist_utils.is_main():
-        param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
+        weight_map = loading_utils.load_safetensors_weight_map(weight_dir)
+        loaded_shards = set()
+        loaded = loading_utils.ensure_params_loaded(
+            weight_dir,
+            param_buffer,
+            ["model.embed_tokens.weight"],
+            weight_map,
+            loaded_shards,
+        )
+        dist_utils.print_on_main(f"Loaded embedding parameter from shards: {loaded}")
     dist_utils.barrier(device_ids=[rank])
 
     # Get resume block id
@@ -161,7 +172,19 @@ def main():
     position_ids = []
     model.model.embed_tokens.to_empty(device=device)
     if dist_utils.is_main():
-        model.model.embed_tokens.weight.data = param_buffer["model.embed_tokens.weight"].to(device=device, dtype=dtype)
+        embedding_state_dict = {
+            k: v
+            for k, v in param_buffer.items()
+            if k in ("model.embed_tokens.weight", "model.embed_tokens.weight_scale_inv")
+        }
+        if not quant_utils.can_dequantize_from_fp8(embedding_state_dict):
+            raise RuntimeError(
+                "The input embedding is stored as FP8 but model.embed_tokens.weight_scale_inv is missing."
+            )
+        quant_utils.dequantize_state_dict(embedding_state_dict, dtype)
+        model.model.embed_tokens.weight.data = embedding_state_dict["model.embed_tokens.weight"].to(
+            device=device, dtype=dtype
+        )
     if dist_utils.is_dist_available_and_initialized():
         dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
@@ -171,6 +194,7 @@ def main():
     # Offload embeddings back to meta
     model.model.embed_tokens.to(device="meta")
     param_buffer.pop("model.embed_tokens.weight", None)
+    param_buffer.pop("model.embed_tokens.weight_scale_inv", None)
 
     for block_idx, block in tqdm(
         enumerate(model.model.layers), desc="Processing transformer blocks", total=len(model.model.layers)
@@ -195,29 +219,34 @@ def main():
             dist.send_object_list(rank_block_keys, dst=0)
 
         if dist_utils.is_main():
-            can_dequantize = True
+            loaded = loading_utils.ensure_params_loaded(
+                weight_dir,
+                param_buffer,
+                block_keys_with_prefix,
+                weight_map,
+                loaded_shards,
+            )
+            if loaded:
+                dist_utils.print_on_main(f"Loaded block {block_idx} parameters from shards: {loaded}")
             # Select weights corresponding to current block
             block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-            while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
-                current_shard_id += 1
-                weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
-                param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
-                # Update weights corresponding to current block
-                block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-                can_dequantize = quant_utils.can_dequantize_from_fp8(block_state_dict)
+            if not quant_utils.can_dequantize_from_fp8(block_state_dict):
+                raise RuntimeError(f"Block {block_idx} has FP8 weights but required *_scale_inv tensors were not loaded.")
             # Dequantize weights corresponding to current block
             quant_utils.dequantize_state_dict(block_state_dict, dtype)
+
+        has_routed_experts = any("mlp.experts." in k for k in rank_block_keys)
 
         # Put block onto GPU
         block.to_empty(device=device)
 
-        # Simply load block state dict on master and broadcast
-        if block_idx < model.config.first_k_dense_replace:
+        # Dense blocks are replicated on all ranks. MoE blocks may contain rank-local experts.
+        if not has_routed_experts:
             if dist_utils.is_main():
                 block.load_state_dict(block_state_dict)
             if dist_utils.is_dist_available_and_initialized():
                 dist_utils.broadcast_parameters(block)
-        # Send dict with part of expets to target device
+        # Send dict with part of experts to target devices.
         else:
             if dist_utils.is_main():
                 # Load state dict on master
@@ -418,10 +447,14 @@ def main():
             inputs[i] = block(inputs[i].to(device), position_ids=position_ids[i])[0].to(offload_device)
             assert torch.isfinite(inputs[i]).all().item(), "NaN of inf encountered."
 
-        # Offload block
+        # Offload block and release its CPU checkpoint tensors, including FP8 scales.
         block.to(device="meta")
-        for k in block_keys_with_prefix:
-            param_buffer.pop(k, None)
+        block_buffer_keys = set(block_keys_with_prefix)
+        block_buffer_keys.update(
+            f"{key}_scale_inv" for key in block_keys_with_prefix if key.endswith(".weight")
+        )
+        for key in block_buffer_keys:
+            param_buffer.pop(key, None)
 
         torch.cuda.empty_cache()
         gc.collect()
