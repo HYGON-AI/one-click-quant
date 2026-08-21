@@ -78,7 +78,7 @@ def pack_weight(
 def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
     ignored_modules = ["lm_head"]
     if args.quantize_only_experts:
-        ignored_modules += ["re:.*self_attn.*", "re:.*shared_experts.*", "re:.*mlp\.(gate|up|gate_up|down)_proj.*"]
+        ignored_modules += [r"re:.*self_attn.*", r"re:.*shared_experts.*", r"re:.*mlp\.(gate|up|gate_up|down)_proj.*"]
     return {
         "config_groups": {
             "group_0": {

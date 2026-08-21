@@ -19,7 +19,7 @@ except:
 from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
 
 
-ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
+ROUTED_EXPERTS_REGEX = r".*mlp\.experts\.\d+\.(down|gate|up)_proj"
 TIED_FFN_GROUPS = ("gate_proj", "up_proj")
 
 
