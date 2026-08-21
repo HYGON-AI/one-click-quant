@@ -100,7 +100,7 @@ def get_resume_block_idx(save_dir: os.PathLike) -> int:
 def main():
     args = parse_args()
     # Distributed init
-    if dist.is_available():
+    if dist.is_available() and all(var in os.environ for var in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")):
         dist.init_process_group(backend="nccl", init_method="env://")
     world_size = dist_utils.get_world_size()
     rank = dist_utils.get_rank()
@@ -271,7 +271,7 @@ def main():
                     args.quantization_scale,
                     is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
                     tied_gptq_handle=tied_gptq_handle
-                )    
+                )
 
                 if tied_gptq_handle is None:
                     hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
@@ -388,10 +388,13 @@ def main():
 
                 dist_utils.barrier(device_ids=[rank])
 
-                dist.gather_object(rank_expert_message, expert_messages)
-                if dist_utils.is_main():
-                    for expert_message in expert_messages:
-                        dist_utils.print_on_main(expert_message)
+                if dist_utils.is_dist_available_and_initialized():
+                    dist.gather_object(rank_expert_message, expert_messages)
+                    if dist_utils.is_main():
+                        for expert_message in expert_messages:
+                            dist_utils.print_on_main(expert_message)
+                else:
+                    dist_utils.print_on_main(rank_expert_message)
 
                 # TODO sync data from other processes
                 dist_utils.print_on_main("-" * 10)
@@ -434,7 +437,8 @@ def main():
             os.path.join(args.save_dir, "metadata.pt")
         )
 
-    dist.destroy_process_group()
+    if dist_utils.is_dist_available_and_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
