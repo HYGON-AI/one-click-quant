@@ -160,8 +160,19 @@ class GPTQ:
         """
         # 1) Define constants and chunk
         d_row, d_col, block_size, device, dtype = self.d_row, self.d_col, self.block_size, self.W_device, self.W_dtype
-        # 2) Get quantization group size
-        group_size = self.group_size or d_col
+        # 2) Get quantization group size. Omitting group_size means one
+        # quantization group per output channel (the full input dimension).
+        if self.group_size is None:
+            group_size = d_col
+        else:
+            group_size = self.group_size
+            if group_size <= 0:
+                raise ValueError(f"group_size must be positive, got {group_size}.")
+            if d_col % group_size != 0:
+                raise ValueError(
+                    f"group_size ({group_size}) must divide the layer input "
+                    f"dimension ({d_col})."
+                )
         num_groups = d_col // group_size
 
         is_main_gptq_process = dist_utils.is_main() or not self.is_distributed
@@ -170,7 +181,7 @@ class GPTQ:
             # Get scale, qzero 
             scale, zero, maxq = quant_utils.get_quantization_grid(
                 weight=self.W,
-                group_size=self.group_size,
+                group_size=group_size,
                 bits=bits,
                 symmetric=self.sym,
                 dtype=dtype,

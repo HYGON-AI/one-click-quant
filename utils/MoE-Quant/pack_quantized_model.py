@@ -70,8 +70,29 @@ def pack_weight(
 ) -> dict[torch.Tensor]:
     compressed_data = {}
     qweight, scale, zero = weight['qweight'], weight['scale'], weight['zero']
-    group_size = group_size or qweight.shape[-1]
-    qweight_shifted = qweight.to(torch.int8) - zero.repeat_interleave(group_size, dim=-1).to(torch.int8)
+    if qweight.ndim != 2:
+        raise ValueError(f"qweight must be 2D, got shape {tuple(qweight.shape)}.")
+    effective_group_size = qweight.shape[-1] if group_size is None else group_size
+    if effective_group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {effective_group_size}.")
+    if qweight.shape[-1] % effective_group_size != 0:
+        raise ValueError(
+            f"group_size ({effective_group_size}) must divide the quantized "
+            f"weight input dimension ({qweight.shape[-1]})."
+        )
+    expected_meta_shape = (
+        qweight.shape[0],
+        qweight.shape[-1] // effective_group_size,
+    )
+    if tuple(scale.shape) != expected_meta_shape or tuple(zero.shape) != expected_meta_shape:
+        raise ValueError(
+            "Quantization scale and zero-point shapes must both be "
+            f"{expected_meta_shape}, got scale={tuple(scale.shape)} and "
+            f"zero={tuple(zero.shape)}."
+        )
+    qweight_shifted = qweight.to(torch.int8) - zero.repeat_interleave(
+        effective_group_size, dim=-1
+    ).to(torch.int8)
     qweight_packed = pack_to_int32(qweight_shifted, bits)
     compressed_data = {
         "weight_packed": qweight_packed,
@@ -101,6 +122,7 @@ def prepare_quantization_config(
         }
 
     ignore_rule, ignored_modules = adapter.get_quantization_ignore(args.quantize_only_experts)
+    weight_strategy = "channel" if args.group_size is None else "group"
     print(f"[INFO] quantization_config ignore rule={ignore_rule}, count={len(ignored_modules)}")
     return {
         "config_groups": {
@@ -118,7 +140,7 @@ def prepare_quantization_config(
                     "num_bits": args.bits,
                     "observer": "minmax",
                     "observer_kwargs": {},
-                    "strategy": "group",
+                    "strategy": weight_strategy,
                     "symmetric": True,
                     "type": "int"
                 }
