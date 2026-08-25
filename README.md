@@ -7,7 +7,8 @@
   - [BLOCK FP8转BF16](#block-fp8转bf16)
 - [定制化模型量化方法](#定制化模型量化方法)
 - [强制使用某个量化算法](#强制使用某个量化算法)
-- [slimquant(w4a8)量化方法](#slimquant-w4a8量化方法)
+- [MoE-Quant](#slimquant-w4a8量化方法)
+- [单机环境下基于GPTQ的MOE大权重模型量化方法](#moe-quant)
 - [PPL评估](#ppl评估)
 - [精度调优](#精度调优)
   - [离群通道分析](#离群通道分析)
@@ -165,6 +166,10 @@ python main.py --model DeepSeek-V3.2-bf16/ --alg slimquant_ptq --scheme W4A8 \
 ```
 
 当前已支持ignore的模型，启动无需加\-\-ignore参数，未匹配的模型会采用默认ignore参数""lm\_head, re:\.\*mlp\.gate$, re:\.\*embed\_tokens\.\*""
+
+# MoE-Quant
+
+单机环境下，基于GPTQ的MOE大权重模型int4量化方法，详见[MoE-Quant](/utils/MoE-Quant/README.md)
 
 # PPL评估
 
