@@ -10,12 +10,12 @@ from tqdm import tqdm
 import torch
 from safetensors.torch import save_file
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer
 from compressed_tensors.compressors import pack_to_int32
 
 from src import quant_utils
 from src import loading_utils
-from src.models import qwen3_5_moe_utils
+from src.models import ModelAdapter, get_model_adapter
 
 
 def parse_args():
@@ -83,7 +83,10 @@ def pack_weight(
     return compressed_data
 
 
-def prepare_quantization_config(args: argparse.Namespace, is_qwen3_5_moe: bool = False) -> dict[str, Any]:
+def prepare_quantization_config(
+    args: argparse.Namespace,
+    adapter: ModelAdapter,
+) -> dict[str, Any]:
     input_activations = None
     if args.activation_bits == 8:
         input_activations = {
@@ -97,38 +100,7 @@ def prepare_quantization_config(args: argparse.Namespace, is_qwen3_5_moe: bool =
             "type": "int",
         }
 
-    ignored_modules = ["lm_head"]
-    ignore_rule = "default"
-    if args.quantize_only_experts:
-        if is_qwen3_5_moe:
-            ignored_modules += [
-                "model.embed_tokens",
-                r"re:.*linear_attn\.conv1d$",
-                r"re:.*linear_attn\.in_proj_a$",
-                r"re:.*linear_attn\.in_proj_b$",
-                r"re:.*linear_attn\.in_proj_qkv$",
-                r"re:.*linear_attn\.in_proj_z$",
-                r"re:.*linear_attn\.out_proj$",
-                r"re:.*mlp\.gate$",
-                r"re:.*mlp\.shared_expert\.(gate|up|down)_proj$",
-                r"re:.*mlp\.shared_expert_gate$",
-                r"re:.*self_attn\.(q|k|v|o)_proj$",
-                "mtp.fc",
-                r"re:^mtp\.layers\.0\.mlp\.gate$",
-                r"re:^mtp\.layers\.0\.mlp\.shared_expert\.(gate|up|down)_proj$",
-                r"re:^mtp\.layers\.0\.mlp\.shared_expert_gate$",
-                r"re:^mtp\.layers\.0\.self_attn\.(q|k|v|o)_proj$",
-                "mtp.pre_fc_norm_embedding",
-                "mtp.pre_fc_norm_hidden",
-            ]
-            ignore_rule = "qwen3_5_moe_experts_only"
-        else:
-            ignored_modules += [
-                r"re:.*self_attn.*",
-                r"re:.*shared_experts.*",
-                r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
-            ]
-            ignore_rule = "default_experts_only"
+    ignore_rule, ignored_modules = adapter.get_quantization_ignore(args.quantize_only_experts)
     print(f"[INFO] quantization_config ignore rule={ignore_rule}, count={len(ignored_modules)}")
     return {
         "config_groups": {
@@ -165,21 +137,18 @@ def main():
 
     dtype = getattr(torch, args.dtype)
 
-    # Load DeepSeek model
+    # Load model configuration and select its structural adapter.
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
-    is_qwen3_5_moe = getattr(config, "model_type", None) == "qwen3_5_moe_text"
+    adapter = get_model_adapter(config)
+    print(f"[INFO] model adapter={adapter.name}")
+    adapter.prepare_config(config, world_size=1)
 
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(
-            config=config,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16
-        ).eval()
+        model = adapter.build_empty_model(config, torch.bfloat16).eval()
         model.config.use_cache = False
-        if is_qwen3_5_moe:
-            qwen3_5_moe_utils.prepare_qwen3_5_moe_model(model, config, torch.bfloat16)
+        adapter.prepare_model(model, config, torch.bfloat16)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
@@ -195,8 +164,9 @@ def main():
     # assuming DeepSeek's model-xxxxx-of-000163 naming convention.
     weight_dir = args.model_name_or_path
     weight_map = loading_utils.load_safetensors_weight_map(weight_dir)
-    num_mtp_shards = qwen3_5_moe_utils.count_mtp_shards(weight_map) if is_qwen3_5_moe else 0
-    num_output_shards = len(model.model.layers) + 2 + num_mtp_shards
+    num_extra_shards = adapter.count_extra_shards(weight_map)
+    transformer_layers = adapter.get_transformer_layers(model)
+    num_output_shards = len(transformer_layers) + 2 + num_extra_shards
     current_output_shard_id = 1
     quantized_layer_names = defaultdict(list)
     for layer_name in sorted(os.listdir(args.quantized_model_path)):
@@ -212,7 +182,7 @@ def main():
     loaded = loading_utils.ensure_params_loaded(
         weight_dir,
         param_buffer,
-        ["model.embed_tokens.weight"],
+        [adapter.embedding_weight_key()],
         weight_map,
         loaded_shards,
     )
@@ -223,7 +193,7 @@ def main():
     embedding_state_dict = {
         k: v
         for k, v in param_buffer.items()
-        if k in ("model.embed_tokens.weight", "model.embed_tokens.weight_scale_inv")
+        if k in adapter.embedding_state_keys()
     }
     if not quant_utils.can_dequantize_from_fp8(embedding_state_dict):
         raise RuntimeError(
@@ -232,21 +202,21 @@ def main():
     quant_utils.dequantize_state_dict(embedding_state_dict, dtype)
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
     save_file(
-        {"model.embed_tokens.weight": embedding_state_dict["model.embed_tokens.weight"]},
+        {adapter.embedding_weight_key(): embedding_state_dict[adapter.embedding_weight_key()]},
         os.path.join(args.packed_model_path, current_output_shard_path)
     )
-    safetensors_index["model.embed_tokens.weight"] = current_output_shard_path
-    param_buffer.pop("model.embed_tokens.weight", None)
-    param_buffer.pop("model.embed_tokens.weight_scale_inv", None)
+    safetensors_index[adapter.embedding_weight_key()] = current_output_shard_path
+    param_buffer.pop(adapter.embedding_weight_key(), None)
+    param_buffer.pop(adapter.embedding_weight_key() + "_scale_inv", None)
 
     # Process blocks
     for block_idx, block in tqdm(
-        enumerate(model.model.layers),
+        enumerate(transformer_layers),
         desc="Processing transformer blocks",
-        total=len(model.model.layers)
+        total=len(transformer_layers)
     ):
         current_output_shard_id += 1
-        prefix = f"model.layers.{block_idx}."
+        prefix = adapter.get_layer_prefix(block_idx)
         block_keys_with_prefix = set(f"{prefix}{k}" for k in block.state_dict())
 
         loading_utils.ensure_params_loaded(
@@ -286,42 +256,42 @@ def main():
         del block_state_dict
         gc.collect()
 
-    # Load final model tensors by name; their shard can be anywhere in the input index.
+    final_tensor_keys = adapter.get_final_tensor_keys()
     loading_utils.ensure_params_loaded(
         weight_dir,
         param_buffer,
-        ["lm_head.weight", "model.norm.weight"],
+        final_tensor_keys,
         weight_map,
         loaded_shards,
     )
 
-    # Save lm head
+    # Save final tensors
     current_output_shard_id += 1
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
     save_file(
-        {
-            "lm_head.weight": param_buffer["lm_head.weight"],
-            "model.norm.weight": param_buffer["model.norm.weight"]
-        },
+        {key: param_buffer[key] for key in final_tensor_keys},
         os.path.join(args.packed_model_path, current_output_shard_path)
     )
-    safetensors_index["lm_head.weight"] = current_output_shard_path
-    safetensors_index["model.norm.weight"] = current_output_shard_path
-    # Copy MTP weights verbatim (Qwen3.5-MoE only)
-    if is_qwen3_5_moe:
-        qwen3_5_moe_utils.save_mtp_weights(
-            weight_dir,
-            weight_map,
-            args.packed_model_path,
-            current_output_shard_id + 1,
-            num_output_shards,
-            safetensors_index,
-        )
+    for key in final_tensor_keys:
+        safetensors_index[key] = current_output_shard_path
+    current_output_shard_id = adapter.save_extra_weights(
+        weight_dir,
+        weight_map,
+        args.packed_model_path,
+        current_output_shard_id + 1,
+        num_output_shards,
+        safetensors_index,
+    )
     # Save safetensors index
     with open(os.path.join(args.packed_model_path, "model.safetensors.index.json"), "w") as f:
-        json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
+        json.dump(
+            {"metadata": {}, "weight_map": safetensors_index},
+            f,
+            indent=2,
+        )
+        f.write("\n")
     # Add quantization metadata
-    config.quantization_config = prepare_quantization_config(args, is_qwen3_5_moe)
+    config.quantization_config = prepare_quantization_config(args, adapter)
     # Save configs
     config.save_pretrained(args.packed_model_path)
     model.generation_config.save_pretrained(args.packed_model_path)
