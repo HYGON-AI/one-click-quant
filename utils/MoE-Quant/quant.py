@@ -1,13 +1,12 @@
 import os
 import gc
-import re
 import argparse
 
 from tqdm import tqdm
 import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer
 
 try:
     import wandb
@@ -17,10 +16,9 @@ except:
 
 
 from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
-from src.models import qwen3_5_moe_utils
+from src.models import get_model_adapter
 
 
-ROUTED_EXPERTS_REGEX = r".*mlp\.experts\.\d+\.(down|gate|up)_proj"
 TIED_FFN_GROUPS = ("gate_proj", "up_proj")
 
 
@@ -116,30 +114,31 @@ def main():
         assert wandb_enabled, "wandb not installed. try `pip install wandb`"
         wandb.init(config=args)
 
-    # Load DeepSeek model
+    # Load model configuration and select its structural adapter.
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    # Sanity check
-    # assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
-    config.ep_size = world_size
+    adapter = get_model_adapter(config)
+    print(f"[INFO] model adapter={adapter.name}")
+    adapter.prepare_config(config, world_size)
 
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(
-            config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=dtype       # eager, sdpa
+        model = adapter.build_empty_model(
+            config,
+            dtype,
+            attn_implementation="flash_attention_2",  # eager, sdpa
         ).eval()
         model.config.use_cache = False
-        if getattr(config, "model_type", None) == "qwen3_5_moe_text":
-            qwen3_5_moe_utils.prepare_qwen3_5_moe_model(model, config, dtype)
+        adapter.prepare_model(model, config, dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
     # Prepare calibration dataset
-    print(f"Preparing calibration dataset...")
+    print(f"[INFO] Preparing calibration dataset...")
     calibration_dataset = data_utils.prepare_calibration_dataset(
         args.dataset_name_or_path, tokenizer, args.max_sequence_length, args.num_calibration_samples, args.seed
     )
-    print(f"Calibration dataset prepared, {len(calibration_dataset)} sequences.")
+    print(f"[INFO] Calibration dataset prepared, {len(calibration_dataset)} sequences.")
 
     # Take slices (if running on multiple workers)
     num_seq_per_rank = len(calibration_dataset) // world_size
@@ -155,7 +154,7 @@ def main():
         loaded = loading_utils.ensure_params_loaded(
             weight_dir,
             param_buffer,
-            ["model.embed_tokens.weight"],
+            [adapter.embedding_weight_key()],
             weight_map,
             loaded_shards,
         )
@@ -170,36 +169,38 @@ def main():
     # Prepare input embeddings and position ids
     inputs = []
     position_ids = []
-    model.model.embed_tokens.to_empty(device=device)
+    embedding_module = adapter.get_embedding_module(model)
+    embedding_module.to_empty(device=device)
     if dist_utils.is_main():
         embedding_state_dict = {
             k: v
             for k, v in param_buffer.items()
-            if k in ("model.embed_tokens.weight", "model.embed_tokens.weight_scale_inv")
+            if k in adapter.embedding_state_keys()
         }
         if not quant_utils.can_dequantize_from_fp8(embedding_state_dict):
             raise RuntimeError(
                 "The input embedding is stored as FP8 but model.embed_tokens.weight_scale_inv is missing."
             )
         quant_utils.dequantize_state_dict(embedding_state_dict, dtype)
-        model.model.embed_tokens.weight.data = embedding_state_dict["model.embed_tokens.weight"].to(
+        embedding_module.weight.data = embedding_state_dict[adapter.embedding_weight_key()].to(
             device=device, dtype=dtype
         )
     if dist_utils.is_dist_available_and_initialized():
-        dist_utils.broadcast_parameters(model.model.embed_tokens)
+        dist_utils.broadcast_parameters(embedding_module)
     for i in range(num_seq_per_rank):
         seq_length = calibration_dataset[i].shape[1]
-        inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)).to(offload_device))
+        inputs.append(embedding_module(calibration_dataset[i].to(device)).to(offload_device))
         position_ids.append(torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0))
     # Offload embeddings back to meta
-    model.model.embed_tokens.to(device="meta")
-    param_buffer.pop("model.embed_tokens.weight", None)
-    param_buffer.pop("model.embed_tokens.weight_scale_inv", None)
+    embedding_module.to(device="meta")
+    param_buffer.pop(adapter.embedding_weight_key(), None)
+    param_buffer.pop(adapter.embedding_weight_key() + "_scale_inv", None)
 
+    transformer_layers = adapter.get_transformer_layers(model)
     for block_idx, block in tqdm(
-        enumerate(model.model.layers), desc="Processing transformer blocks", total=len(model.model.layers)
+        enumerate(transformer_layers), desc="Processing transformer blocks", total=len(transformer_layers)
     ):
-        prefix = f"model.layers.{block_idx}."
+        prefix = adapter.get_layer_prefix(block_idx)
 
         # Collect state dict keys from all processes
         rank_block_keys = [k for k in block.state_dict()]
@@ -235,7 +236,7 @@ def main():
             # Dequantize weights corresponding to current block
             quant_utils.dequantize_state_dict(block_state_dict, dtype)
 
-        has_routed_experts = any("mlp.experts." in k for k in rank_block_keys)
+        has_routed_experts = adapter.has_routed_experts(rank_block_keys)
 
         # Put block onto GPU
         block.to_empty(device=device)
@@ -281,7 +282,7 @@ def main():
 
                     return _hook
 
-                if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
+                if args.quantize_only_experts and not adapter.is_routed_expert(layer_name):
                     continue
 
                 tied_gptq_handle = None
@@ -298,7 +299,7 @@ def main():
                     args.block_size,
                     args.quantization_order,
                     args.quantization_scale,
-                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
+                    is_distributed=not adapter.is_routed_expert(layer_name),
                     tied_gptq_handle=tied_gptq_handle
                 )
 
@@ -307,14 +308,18 @@ def main():
 
             # Collect Hessians
             for i in range(num_seq_per_rank):
-                block(inputs[i].to(device), position_ids=position_ids[i])
+                adapter.forward_block(
+                    block,
+                    inputs[i].to(device),
+                    position_ids[i],
+                )
 
             for _, h in hooks.items():
                 h.remove()
 
             dist_utils.barrier(device_ids=[rank])
 
-            shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
+            shared_handles = {k: v for k, v in handles.items() if not adapter.is_routed_expert(k)}
             expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
 
             # Quantized shared handles first
@@ -444,7 +449,11 @@ def main():
 
         # Update activations
         for i in range(num_seq_per_rank):
-            inputs[i] = block(inputs[i].to(device), position_ids=position_ids[i])[0].to(offload_device)
+            inputs[i] = adapter.forward_block(
+                block,
+                inputs[i].to(device),
+                position_ids[i],
+            ).to(offload_device)
             assert torch.isfinite(inputs[i]).all().item(), "NaN of inf encountered."
 
         # Offload block and release its CPU checkpoint tensors, including FP8 scales.

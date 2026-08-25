@@ -16,7 +16,8 @@ MoE-Quant 的加载 / 量化 / 专家并行都基于“每个专家是独立 ``n
    ``block(inputs, position_ids=...)``，而 Qwen3.5 的 decoder layer 需要
    ``position_embeddings`` 与因果 mask，这里复刻 ``Qwen3_5MoeTextModel.forward``
    的准备逻辑，包括 mrope 计算）；
-3. MTP 权重原样转存（transformers 主模型不加载 MTP，打包时需保留）。
+3. MTP FP8 权重解量化为 BF16 后转存（transformers 主模型不加载 MTP，
+   打包时需保留，并从 compressed-tensors W4 目标中排除）。
 
 注意：本模块只针对纯文本 ``Qwen3_5MoeForCausalLM``（model_type
 ``qwen3_5_moe_text``），多模态 / 其它模型不受影响。
@@ -36,6 +37,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
     Qwen3_5MoeTopKRouter,
 )
+
+from .. import quant_utils
 
 
 class Qwen3_5MoeExpertMLP(nn.Module):
@@ -402,10 +405,29 @@ def save_mtp_weights(
     safetensors_index: dict[str, str],
 ) -> int:
     """
-    把 checkpoint 中的 ``mtp.*`` 权重原样转存到打包目录（key、dtype、数值均不变），
-    并按输入 shard 分组保存，更新输出 safetensors index。返回下一个 shard id。
+    Dequantize checkpoint ``mtp.*`` FP8 weights to BF16 and save them by input
+    shard.  MTP is excluded from compressed-tensors quantization, so the output
+    contains ordinary BF16 weights without ``weight_scale_inv`` tensors.
     """
-    mtp_files = sorted({fname for key, fname in weight_map.items() if key.startswith("mtp.")})
+    mtp_keys = {key for key in weight_map if key.startswith("mtp.")}
+    packed_keys = sorted(key for key in mtp_keys if key.endswith(".weight_packed"))
+    if packed_keys:
+        raise ValueError(
+            "Cannot convert packed MTP weights to BF16: "
+            f"found {packed_keys[0]}."
+        )
+
+    for scale_key in sorted(key for key in mtp_keys if key.endswith(".weight_scale_inv")):
+        weight_key = scale_key.removesuffix("_scale_inv")
+        if weight_key not in mtp_keys:
+            raise KeyError(f"MTP FP8 scale {scale_key} has no matching weight.")
+        if weight_map[weight_key] != weight_map[scale_key]:
+            raise ValueError(
+                f"MTP FP8 weight {weight_key} and scale {scale_key} must be "
+                "stored in the same shard for memory-bounded conversion."
+            )
+
+    mtp_files = sorted({weight_map[key] for key in mtp_keys})
     for fname in mtp_files:
         fpath = os.path.join(weight_dir, fname)
         mtp_tensors = {}
@@ -415,6 +437,17 @@ def save_mtp_weights(
                     mtp_tensors[key] = f.get_tensor(key)
         if not mtp_tensors:
             continue
+
+        if not quant_utils.can_dequantize_from_fp8(mtp_tensors):
+            raise RuntimeError(
+                f"MTP shard {fname} contains an FP8 weight without its "
+                "matching weight_scale_inv tensor."
+            )
+        quant_utils.dequantize_state_dict(mtp_tensors, torch.bfloat16)
+        for key, tensor in mtp_tensors.items():
+            if tensor.is_floating_point() and tensor.dtype != torch.bfloat16:
+                mtp_tensors[key] = tensor.to(torch.bfloat16)
+
         shard_path = f"model-{next_shard_id:05}-of-{num_output_shards:05}.safetensors"
         save_file(mtp_tensors, os.path.join(packed_model_path, shard_path))
         for key in mtp_tensors:
