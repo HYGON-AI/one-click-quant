@@ -52,7 +52,12 @@ def parse_args():
         "--group_size",
         type=int,
         default=None,
-        help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
+        help=(
+            "Weight quantization granularity. Omit this option for channel-wise "
+            "quantization (one scale per output channel); specify a positive "
+            "integer to quantize groups of that many input columns. The value "
+            "must divide each quantized layer's input dimension."
+        ),
     )
     parser.add_argument("--sym", action="store_true", help="Whether to use symmetric quantization")
     parser.add_argument("--rel_damp", type=float, default=1e-2)
@@ -103,6 +108,16 @@ def main():
         dist.init_process_group(backend="nccl", init_method="env://")
     world_size = dist_utils.get_world_size()
     rank = dist_utils.get_rank()
+    if args.group_size is None:
+        dist_utils.print_on_main(
+            "[INFO] weight quantization strategy=channel-wise "
+            "(one scale per output channel)"
+        )
+    else:
+        dist_utils.print_on_main(
+            f"[INFO] weight quantization strategy=group-wise, "
+            f"group_size={args.group_size}"
+        )
     # init device
     device = f"cuda:{rank}"
     torch.set_grad_enabled(False)
