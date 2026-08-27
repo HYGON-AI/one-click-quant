@@ -8,7 +8,7 @@
 - [定制化模型量化方法](#定制化模型量化方法)
 - [强制使用某个量化算法](#强制使用某个量化算法)
 - [slimquant(w4a8)量化方法](#slimquant-w4a8量化方法)
-- [MoE-Quant](/utils/MoE-Quant/README.md)
+- [MoE-Quant(单机大权重gptq量化)](/utils/MoE-Quant/README.md)
 - [PPL评估](#ppl评估)
 - [精度调优](/docs/precision-tuning.md)
 - [提交PR](#提交pr)

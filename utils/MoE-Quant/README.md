@@ -1,6 +1,6 @@
 ## MoE-Quant
 ---
-这是一个基于[MoE-Quant](https://github.com/IST-DASLab/MoE-Quant)改造的量化工具，目标是在单机(如八卡H20)环境下可以对大权重模型(如5T级别BF16)做数据集校准的int4量化转换。
+这是一个基于[IST-DASLab/MoE-Quant](https://github.com/IST-DASLab/MoE-Quant)改造的量化工具，目标是在单机环境下可以对大权重模型(如5T级别BF16)做数据集校准的int4量化转换。
 
 ### 特性
 - 支持GPTQ量化算法。
