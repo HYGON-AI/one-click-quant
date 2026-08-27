@@ -273,12 +273,52 @@ def should_keep_tensor(name: str, keep_layers: set[int], num_experts: int) -> bo
     return False
 
 
+def detect_src_format(
+    src_format: str,
+    src_weight_map: dict[str, str],
+    src_dir: Path,
+) -> str:
+    """将 auto 解析为 w4a16 / mxfp4 / int4 / fp8 / bf16。"""
+    if src_format in {"fp8", "mxfp4", "int4", "w4a16", "bf16"}:
+        return src_format
+    if src_format != "auto":
+        raise ValueError(f"不支持的 src_format: {src_format}")
+
+    names = src_weight_map.keys()
+    packed_name = next(
+        (name for name in names if name.endswith(".weight_packed")),
+        None,
+    )
+    if packed_name is not None:
+        packed_file = src_dir / src_weight_map[packed_name]
+        tensors = load_file(str(packed_file), device="cpu")
+        packed = tensors[packed_name]
+        scale_name = f"{packed_name.removesuffix('.weight_packed')}.weight_scale"
+        scale = tensors.get(scale_name)
+        if scale is None:
+            scale_file = src_weight_map.get(scale_name)
+            if scale_file is not None:
+                scale = load_file(
+                    str(src_dir / scale_file), device="cpu"
+                ).get(scale_name)
+        if packed.dtype == torch.int32:
+            return "w4a16"
+        if scale is not None and scale.dtype == torch.uint8:
+            return "mxfp4"
+        return "int4"
+
+    if any(name.endswith(".weight_scale") for name in names):
+        return "fp8"
+    return "bf16"
+
+
 def needs_dequant(weight_tensor: torch.Tensor) -> bool:
     """判断权重是否为 FP8（需要解量化）"""
     return weight_tensor.dtype in (
         torch.float8_e4m3fn,
         getattr(torch, "float8_e4m3fnuz", None),
     )
+
 
 # ─── 权重解量化 ───
 
@@ -445,7 +485,10 @@ def build_mini_model(
     with open(index_path) as f:
         src_index = json.load(f)
     src_weight_map: dict[str, str] = src_index.get("weight_map", {})
+    resolved_src_format = detect_src_format(src_format, src_weight_map, src_dir)
+
     print(f"源模型张量: {len(src_weight_map)}")
+    print(f"源格式: {src_format} -> {resolved_src_format}")
     print(f"保留层 (源 0-index): {keep_layers}")
 
     # ── 2. 筛选 ──
@@ -518,7 +561,7 @@ def build_mini_model(
                 gate_jobs.append(f"e_score_correction_bias (layer {em.group(1)})")
 
             # ── MXFP4 packed → BF16 ──
-            if name.endswith(".weight_packed") and src_format == "mxfp4" and not keep_quant:
+            if name.endswith(".weight_packed") and resolved_src_format == "mxfp4" and not keep_quant:
                 deq = dequant_mxfp4_packed(name, tensors)
                 if deq is not None:
                     base = name.replace(".weight_packed", "")
@@ -529,7 +572,7 @@ def build_mini_model(
                     continue
 
             # ── INT4 uint8-packed → BF16 ──
-            if name.endswith(".weight_packed") and src_format == "int4" and not keep_quant:
+            if name.endswith(".weight_packed") and resolved_src_format == "int4" and not keep_quant:
                 deq = dequant_int4_packed(name, tensors)
                 if deq is not None:
                     base = name.replace(".weight_packed", "")
@@ -540,7 +583,7 @@ def build_mini_model(
                     continue
 
             # ── W4A16 int32-packed → BF16 ──
-            if name.endswith(".weight_packed") and src_format == "w4a16" and not keep_quant:
+            if name.endswith(".weight_packed") and resolved_src_format == "w4a16" and not keep_quant:
                 deq = dequant_w4a16_packed(name, tensors)
                 if deq is not None:
                     base = name.replace(".weight_packed", "")
@@ -678,8 +721,8 @@ if __name__ == "__main__":
     parser.add_argument("--dst", type=Path,
                         default=Path("/mnt/c/chl/models/Kimi-K3-Mini"),
                         help="输出目录")
-    parser.add_argument("--src-format", choices=["fp8", "mxfp4", "int4", "w4a16", "bf16"], default="fp8",
-                        help="源模型格式 (fp8 / mxfp4 / int4 / w4a16 / bf16)")
+    parser.add_argument("--src-format", choices=["auto", "fp8", "mxfp4", "int4", "w4a16", "bf16"], default="auto",
+                        help="源模型格式；auto 优先识别 w4a16，再识别 fp8 / packed / bf16")
     parser.add_argument("-n", "--num-layers", type=int, default=None,
                         help="保留前 N 层 (0..N-1); 默认 4; 与 --layer-range/--layer-ids 互斥")
     parser.add_argument("--layer-range", type=str, default=None,

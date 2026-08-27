@@ -143,11 +143,68 @@ def _fix_shape_mismatch_from_ckpt(model: torch.nn.Module, model_path: Path):
         print(f"  [fix_shape] 共修正 {fixed} 个 shape mismatch 参数")
 
 
+def _find_last_layer_device(device_map: dict):
+    """返回 device_map 中最后一个 `layers.<n>` 所在设备（用于模型尾部模块对齐执行设备）。"""
+    import re
+    last_idx = -1
+    last_device = 0
+    for key, device in device_map.items():
+        match = re.search(r"(^|\.)layers\.(\d+)($|\.)", key)
+        if match:
+            idx = int(match.group(2))
+            if idx > last_idx:
+                last_idx = idx
+                last_device = device
+    return last_device
+
+
+def _apply_module_device_overrides(device_map: dict, overrides: dict[str, str | int]):
+    """在 dispatch 前按显式映射覆盖模块设备；设备值支持特殊值 `last-layer`。"""
+    for module_name, placement in overrides.items():
+        if placement == "last-layer":
+            placement = _find_last_layer_device(device_map)
+        device_map[module_name] = placement
+    if overrides:
+        print(f"  [offload] 模块设备覆盖: {overrides}")
+
+
+def _coalesce_no_split_modules(device_map: dict, model: torch.nn.Module, no_split_classes: list[str]):
+    """将 no-split 类模块（如 DecoderLayer）合并为单个整层 device_map 条目。
+
+    若只对齐子模块条目，dispatch_model 的 hook 会挂在子模块上，层主模块的 forward
+    输入不会被移动到层设备，层内直接访问权重的自定义算子仍会跨设备。因此这里删除
+    该层所有子条目，只保留一个 `层名 -> 设备` 条目。
+    """
+    if not no_split_classes:
+        return
+    coalesced = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Module) or module.__class__.__name__ not in no_split_classes:
+            continue
+        prefix = name + "."
+        child_entries = {k: v for k, v in device_map.items() if k.startswith(prefix)}
+        if not child_entries:
+            continue
+        if name in device_map:
+            target = device_map[name]
+        else:
+            import collections
+            target = collections.Counter(child_entries.values()).most_common(1)[0][0]
+        for child_name in child_entries:
+            del device_map[child_name]
+            coalesced += 1
+        device_map[name] = target
+    if coalesced:
+        print(f"  [offload] 将 {coalesced} 个子模块条目合并为整层条目 (no-split 层 {len(device_map)} 个条目)")
+
+
+
 def load_model(
     model_path: Path,
     device: str,
     max_memory_per_gpu: str | None = None,
     cpu_convert_then_dispatch: bool = False,
+    module_device_overrides: dict[str, str | int] | None = None,
 ):
     """加载 mini 模型；支持 device_map=auto 多卡分配
 
@@ -185,14 +242,13 @@ def load_model(
             f.stat().st_size for f in Path(model_path).glob("*.safetensors")
         ) / 1e9
 
-        # --cpu-convert-then-dispatch 用于 Qwen3.8 full-expert mini：
-        # 先在 CPU 完成 transformers checkpoint-name conversion，避免 expert
-        # torch.stack 的 16GiB 临时张量落到某张 GPU 上导致 OOM。
-        need_offload = cpu_convert_then_dispatch
+        # 指定模块设备覆盖时，必须由本脚本执行 dispatch，才能将覆盖写入 device map。
+        need_offload = cpu_convert_then_dispatch or bool(module_device_overrides)
         max_memory = _build_max_memory(max_memory_per_gpu)
         if need_offload and device != "cpu":
+            mode_reason = "指定模块设备覆盖" if module_device_overrides else "CPU 转换"
             print(f"  [offload] 量化 checkpoint {ckpt_size_gb:.1f}GB, "
-                  f"启用 CPU 加载 → 主动解压 → GPU/CPU dispatch")
+                  f"启用 CPU 加载 → 主动解压 → GPU/CPU dispatch ({mode_reason})")
 
             # ── Monkey-patch caching_allocator_warmup ──
             # transformers 加载/dispatch 大模型时可能按估算大小预热 CUDA cache。
@@ -253,11 +309,23 @@ def load_model(
             print("  [offload] step 3: dispatch dense/CPU 权重到 GPU + CPU...")
             from accelerate import dispatch_model
             from accelerate.utils import infer_auto_device_map
+            # infer_auto_device_map 默认不读取 model._no_split_modules，必须显式传入，
+            # 且必须为 list/tuple：accelerate 对非 list/tuple 会整体包成单元素列表，
+            # 传入 set 会导致类名匹配失败、no-split 不生效。
+            no_split_classes = (
+                getattr(model, "_no_split_modules", None)
+                or getattr(model.__class__, "_no_split_modules", None)
+            )
+            no_split_classes = list(no_split_classes) if no_split_classes else []
+            print(f"  [offload] no_split_module_classes: {no_split_classes}")
             _device_map = infer_auto_device_map(
                 model,
                 max_memory=dispatch_max_memory,
                 dtype=torch.bfloat16,
+                no_split_module_classes=no_split_classes,
             )
+            _coalesce_no_split_modules(_device_map, model, no_split_classes or [])
+            _apply_module_device_overrides(_device_map, module_device_overrides or {})
             dispatch_model(
                 model,
                 device_map=_device_map,
@@ -1015,6 +1083,7 @@ def _worker_run_and_collect(
     num_cases: int | None,
     max_memory_per_gpu: str | None,
     cpu_convert_then_dispatch: bool,
+    module_device_overrides: dict[str, str | int],
     output_path: str,
     queue,  # multiprocessing.Queue; 只传字符串状态，不传 tensor
 ):
@@ -1031,6 +1100,7 @@ def _worker_run_and_collect(
             device,
             max_memory_per_gpu=max_memory_per_gpu,
             cpu_convert_then_dispatch=cpu_convert_then_dispatch,
+            module_device_overrides=module_device_overrides,
         )
         torch.manual_seed(42)
         records = _run_and_collect(
@@ -1067,6 +1137,7 @@ def _sequential_compare(
     num_cases: int | None = None,
     max_memory_per_gpu: str | None = None,
     cpu_convert_then_dispatch: bool = False,
+    module_device_overrides: dict[str, str | int] | None = None,
 ):
     """串行加载: 子进程跑 model_a → 进程退出释放 GPU → 子进程跑 model_b → 对比.
 
@@ -1075,6 +1146,7 @@ def _sequential_compare(
     import multiprocessing as mp
 
     debug_experts = debug_experts or []
+    module_device_overrides = module_device_overrides or {}
 
     def _run_in_subprocess(label: str, model_path: Path):
         import tempfile
@@ -1089,7 +1161,7 @@ def _sequential_compare(
                   use_random, compare_logits, dump_per_layer, log_routing,
                   dump_submodule, debug_layer, debug_experts, num_cases,
                   max_memory_per_gpu, cpu_convert_then_dispatch,
-                  output_path, q),
+                  module_device_overrides, output_path, q),
             daemon=False,
         )
         print(f"\n─── 阶段: 加载 {label} 并收集 (子进程) ───")
@@ -1170,6 +1242,8 @@ def main():
                         help="传给 from_pretrained/max_memory 的每卡显存预算，例如 120GiB；用于约束 auto/balanced 分配")
     parser.add_argument("--cpu-convert-then-dispatch", action="store_true",
                         help="先在 CPU 完成 checkpoint conversion，再 dispatch 到 GPU；用于 full-expert Qwen3.8 mini 避免加载阶段 GPU OOM")
+    parser.add_argument("--module-device-overrides", type=str, default=None,
+                        help="逗号分隔的 完整模块名=设备 映射；在自定义 dispatch 前覆盖模块设备，例如 module_a=cuda:0,module_b=cpu。设备可用 last-layer 表示最后一个 decoder 层所在设备。适用于 Tensor device 不一致错误")
     parser.add_argument("--threshold", type=float, default=0.95,
                         help="Cosine similarity 阈值 (默认 0.95)")
     parser.add_argument("--print-logits", action="store_true",
@@ -1201,6 +1275,15 @@ def main():
     model_a_path = Path(args.model_a)
     model_b_path = Path(args.model_b)
     debug_experts = _parse_debug_experts(args.debug_experts, args.debug_num_experts)
+    if args.module_device_overrides:
+        module_device_overrides = {}
+        for item in args.module_device_overrides.split(","):
+            module_name, separator, placement = item.strip().partition("=")
+            if not separator or not module_name or not placement:
+                parser.error("--module-device-overrides 格式应为 完整模块名=设备，多个映射以逗号分隔")
+            module_device_overrides[module_name] = placement
+    else:
+        module_device_overrides = {}
     for path, label in [(model_a_path, "模型 A"), (model_b_path, "模型 B")]:
         if not path.exists():
             print(f"❌ {label} 路径不存在: {path}")
@@ -1257,6 +1340,7 @@ def main():
         num_cases=args.num_cases,
         max_memory_per_gpu=args.max_memory_per_gpu,
         cpu_convert_then_dispatch=args.cpu_convert_then_dispatch,
+        module_device_overrides=module_device_overrides,
     )
 
     print(f"\n{'=' * 60}")
