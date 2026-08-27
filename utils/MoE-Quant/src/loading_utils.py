@@ -81,6 +81,67 @@ def _expand_fp8_scale_keys(required_keys: set[str], weight_map: dict[str, str]) 
     return expanded_keys
 
 
+def expand_model_keys(
+    model_keys: Iterable[str],
+    weight_map: dict[str, str],
+    adapter,
+) -> set[str]:
+    """Expand logical model keys into physical checkpoint tensor keys."""
+    physical_keys = set()
+    for key in model_keys:
+        physical_keys.update(adapter.checkpoint_keys_for_model_key(key, weight_map))
+    return physical_keys
+
+
+def ensure_model_params_loaded(
+    weight_dir: str,
+    param_buffer: dict[str, torch.Tensor],
+    model_keys: Iterable[str],
+    weight_map: dict[str, str],
+    adapter,
+    loaded_shards: Optional[set[str]] = None,
+) -> list[str]:
+    """Load physical checkpoint tensors needed by logical model state keys."""
+    physical_keys = expand_model_keys(model_keys, weight_map, adapter)
+    return ensure_params_loaded(
+        weight_dir,
+        param_buffer,
+        physical_keys,
+        weight_map,
+        loaded_shards,
+        include_fp8_scales=True,
+    )
+
+
+def materialize_model_state_dict(
+    param_buffer: dict[str, torch.Tensor],
+    model_keys: Iterable[str],
+    weight_map: dict[str, str],
+    adapter,
+    dtype: torch.dtype,
+    expected_shapes: Optional[dict[str, tuple[int, ...]]] = None,
+) -> dict[str, torch.Tensor]:
+    """Materialize logical tensors from their resident physical checkpoint data."""
+    model_key_set = set(model_keys)
+    physical_keys = expand_model_keys(model_key_set, weight_map, adapter)
+    physical_keys.update(
+        f"{key}_scale_inv"
+        for key in model_key_set
+        if f"{key}_scale_inv" in param_buffer
+    )
+    physical_state_dict = {
+        key: param_buffer[key]
+        for key in physical_keys
+        if key in param_buffer
+    }
+    return adapter.materialize_state_dict(
+        physical_state_dict,
+        model_key_set,
+        dtype,
+        expected_shapes=expected_shapes,
+    )
+
+
 def ensure_params_loaded(
     weight_dir: str,
     param_buffer: dict[str, torch.Tensor],

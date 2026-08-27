@@ -15,6 +15,9 @@ torch.set_float32_matmul_precision("highest")
 
 FP8_GROUP_SIZE = 128
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+MXFP4_GROUP_SIZE = 32
+MXFP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+MXFP4_UE8M0_BIAS = 127
 
 
 class QuantizationScale(Enum):
@@ -262,6 +265,62 @@ def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: Optional[torch.T
         return delta.pow(2).mean() / w.pow(2).mean()
     else:
         return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
+
+
+def unpack_mxfp4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack two E2M1 FP4 values from each uint8 checkpoint byte."""
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"MXFP4 weight_packed must use uint8, got {packed.dtype}.")
+    if packed.ndim != 2 or packed.shape[-1] == 0:
+        raise ValueError(
+            f"MXFP4 weight_packed must be a non-empty 2D tensor, got {tuple(packed.shape)}."
+        )
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    nibbles = torch.stack((low, high), dim=-1).reshape(
+        packed.shape[0], packed.shape[1] * 2
+    )
+    lut = torch.tensor(MXFP4_E2M1_VALUES, device=packed.device, dtype=torch.float32)
+    sign = 1.0 - 2.0 * ((nibbles >> 3) & 1).to(torch.float32)
+    return sign * lut[(nibbles & 0x07).long()]
+
+
+def dequantize_weight_from_mxfp4(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    expected_shape: Optional[tuple[int, ...]] = None,
+) -> torch.Tensor:
+    """Dequantize compressed-tensors MXFP4 E2M1 weights with UE8M0 scales."""
+    if scale.dtype != torch.uint8:
+        raise ValueError(f"MXFP4 weight_scale must use uint8, got {scale.dtype}.")
+    while scale.ndim > 2 and scale.shape[-1] == 1:
+        scale = scale.squeeze(-1)
+    if scale.ndim != 2:
+        raise ValueError(f"MXFP4 weight_scale must be 2D, got {tuple(scale.shape)}.")
+
+    values = unpack_mxfp4(packed)
+    out_features, in_features = values.shape
+    expected_scale_shape = (out_features, in_features // MXFP4_GROUP_SIZE)
+    if in_features % MXFP4_GROUP_SIZE != 0:
+        raise ValueError(
+            f"MXFP4 input dimension ({in_features}) must be divisible by "
+            f"{MXFP4_GROUP_SIZE}."
+        )
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"MXFP4 weight_scale must have shape {expected_scale_shape}, "
+            f"got {tuple(scale.shape)}."
+        )
+    if expected_shape is not None and tuple(values.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"MXFP4 dequantized shape {tuple(values.shape)} does not match "
+            f"logical weight shape {tuple(expected_shape)}."
+        )
+
+    scale_float = torch.exp2(scale.to(torch.float32) - MXFP4_UE8M0_BIAS)
+    values.mul_(scale_float.repeat_interleave(MXFP4_GROUP_SIZE, dim=-1))
+    return values.to(dtype)
 
 
 def dequantize_weight_from_fp8(W, s):

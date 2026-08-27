@@ -1,7 +1,6 @@
 import os
 import gc
 import json
-import shutil
 import argparse
 from collections import defaultdict
 from typing import Optional, Any
@@ -168,7 +167,7 @@ def main():
     adapter.prepare_config(config, world_size=1)
 
     with init_empty_weights():
-        model = adapter.build_empty_model(config, torch.bfloat16).eval()
+        model = adapter.build_packing_model(config, torch.bfloat16).eval()
         model.config.use_cache = False
         adapter.prepare_model(model, config, torch.bfloat16)
 
@@ -181,6 +180,7 @@ def main():
     args.quantize_only_experts = metadata["quantize_only_experts"]
     # Currently we do not support asymmetric quantization
     args.sym = True
+    adapter.validate_packing_args(args)
 
     # Resolve input weights through the HuggingFace safetensors index instead of
     # assuming DeepSeek's model-xxxxx-of-000163 naming convention.
@@ -192,36 +192,66 @@ def main():
     current_output_shard_id = 1
     quantized_layer_names = defaultdict(list)
     for layer_name in sorted(os.listdir(args.quantized_model_path)):
-        if os.path.isdir(os.path.join(args.quantized_model_path, layer_name)):
-            block_idx = int(layer_name.split(".")[2])
-            quantized_layer_names[block_idx].append(layer_name)
+        layer_path = os.path.join(args.quantized_model_path, layer_name)
+        if not os.path.isdir(layer_path):
+            continue
+        block_idx = adapter.get_block_index_from_layer_name(layer_name)
+        quantized_layer_names[block_idx].append(layer_name)
+
+    expected_quantized = adapter.expected_quantized_layer_names(model)
+    if expected_quantized is not None:
+        actual_quantized = {
+            name for names in quantized_layer_names.values() for name in names
+        }
+        missing = sorted(expected_quantized - actual_quantized)
+        unexpected = (
+            sorted(actual_quantized - expected_quantized)
+            if args.quantize_only_experts
+            else []
+        )
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append(
+                    f"missing={len(missing)} ({', '.join(missing[:5])})"
+                )
+            if unexpected:
+                details.append(
+                    f"unexpected={len(unexpected)} ({', '.join(unexpected[:5])})"
+                )
+            raise ValueError(
+                "Incomplete routed-expert GPTQ output: " + "; ".join(details)
+            )
     safetensors_index = {}
     # Prepare directory to save packed weights
     os.makedirs(args.packed_model_path, exist_ok=True)
 
     loaded_shards = set()
     param_buffer = {}
-    loaded = loading_utils.ensure_params_loaded(
+    loaded = loading_utils.ensure_model_params_loaded(
         weight_dir,
         param_buffer,
         [adapter.embedding_weight_key()],
         weight_map,
+        adapter,
         loaded_shards,
     )
     if loaded:
         print(f"Loaded embedding parameter from shards: {loaded}")
 
     # Save embeddings
-    embedding_state_dict = {
-        k: v
-        for k, v in param_buffer.items()
-        if k in adapter.embedding_state_keys()
-    }
-    if not quant_utils.can_dequantize_from_fp8(embedding_state_dict):
-        raise RuntimeError(
-            "The input embedding is stored as FP8 but model.embed_tokens.weight_scale_inv is missing."
-        )
-    quant_utils.dequantize_state_dict(embedding_state_dict, dtype)
+    embedding_state_dict = loading_utils.materialize_model_state_dict(
+        param_buffer,
+        [adapter.embedding_weight_key()],
+        weight_map,
+        adapter,
+        dtype,
+        expected_shapes={
+            adapter.embedding_weight_key(): tuple(
+                adapter.get_embedding_module(model).weight.shape
+            ),
+        },
+    )
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
     save_file(
         {adapter.embedding_weight_key(): embedding_state_dict[adapter.embedding_weight_key()]},
@@ -239,18 +269,34 @@ def main():
     ):
         current_output_shard_id += 1
         prefix = adapter.get_layer_prefix(block_idx)
-        block_keys_with_prefix = set(f"{prefix}{k}" for k in block.state_dict())
+        logical_block_keys = adapter.logical_block_keys(block, block_idx)
+        quantized_weight_keys = {
+            f"{layer_name}.weight"
+            for layer_name in quantized_layer_names[block_idx]
+        }
+        source_model_keys = logical_block_keys - quantized_weight_keys
 
-        loading_utils.ensure_params_loaded(
+        loading_utils.ensure_model_params_loaded(
             weight_dir,
             param_buffer,
-            block_keys_with_prefix,
+            source_model_keys,
             weight_map,
+            adapter,
             loaded_shards,
         )
-
-        block_state_dict = {k: param_buffer[k] for k in param_buffer if k.startswith(prefix)}
-        quant_utils.dequantize_state_dict(block_state_dict, dtype)
+        expected_shapes = {
+            f"{prefix}{key}": tuple(tensor.shape)
+            for key, tensor in block.state_dict().items()
+            if f"{prefix}{key}" in source_model_keys
+        }
+        block_state_dict = loading_utils.materialize_model_state_dict(
+            param_buffer,
+            source_model_keys,
+            weight_map,
+            adapter,
+            dtype,
+            expected_shapes=expected_shapes,
+        )
 
         for layer_name in quantized_layer_names[block_idx]:
             weight_state_dict = torch.load(
@@ -259,7 +305,7 @@ def main():
                 map_location="cpu"
             )
             packed_weight_state_dict = pack_weight(weight_state_dict, args.bits, args.sym, args.group_size)
-            block_state_dict.pop(f"{layer_name}.weight")
+            block_state_dict.pop(f"{layer_name}.weight", None)
             block_state_dict.pop(f"{layer_name}.weight_scale_inv", None)
             block_state_dict.update({f"{layer_name}.{k}": v for k, v in packed_weight_state_dict.items()})
 
@@ -272,26 +318,37 @@ def main():
         for k in block_state_dict:
             safetensors_index[k] = current_output_shard_path
 
-        for k in block_keys_with_prefix:
-            param_buffer.pop(k, None)
+        # Shard loading may have populated additional tensors sharing this block's
+        # file (notably compact source MXFP4 experts). Evict the entire prefix.
+        for key in list(param_buffer):
+            if key.startswith(prefix):
+                param_buffer.pop(key, None)
 
         del block_state_dict
         gc.collect()
 
     final_tensor_keys = adapter.get_final_tensor_keys()
-    loading_utils.ensure_params_loaded(
+    loading_utils.ensure_model_params_loaded(
         weight_dir,
         param_buffer,
         final_tensor_keys,
         weight_map,
+        adapter,
         loaded_shards,
+    )
+    final_state_dict = loading_utils.materialize_model_state_dict(
+        param_buffer,
+        final_tensor_keys,
+        weight_map,
+        adapter,
+        dtype,
     )
 
     # Save final tensors
     current_output_shard_id += 1
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
     save_file(
-        {key: param_buffer[key] for key in final_tensor_keys},
+        final_state_dict,
         os.path.join(args.packed_model_path, current_output_shard_path)
     )
     for key in final_tensor_keys:
@@ -313,22 +370,15 @@ def main():
         )
         f.write("\n")
     # Add quantization metadata
-    config.quantization_config = prepare_quantization_config(args, adapter)
+    quantization_config = prepare_quantization_config(args, adapter)
+    adapter.set_quantization_config(config, quantization_config)
     # Save configs
     config.save_pretrained(args.packed_model_path)
     model.generation_config.save_pretrained(args.packed_model_path)
     # Save tokenizer
     tokenizer.save_pretrained(args.packed_model_path)
-    # Copy the modeling file shipped with the input model directory.
-    modeling_files = sorted(
-        name for name in os.listdir(args.model_name_or_path)
-        if name.startswith("modeling_") and name.endswith(".py")
-    )
-    if modeling_files:
-        shutil.copy(
-            os.path.join(args.model_name_or_path, modeling_files[0]),
-            args.packed_model_path,
-        )
+    # Copy adapter-specific remote-code and multimodal companion assets.
+    adapter.copy_artifacts(args.model_name_or_path, args.packed_model_path)
 
 
 if __name__ == "__main__":
