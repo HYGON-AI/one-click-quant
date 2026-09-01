@@ -16,7 +16,7 @@
 
 # 简介
 
-基于llmcompressor开发的一键量化工具。
+基于开源社区组件(llmcompressor、MoE-Quant等)开发的一键量化工具。
 
 # 环境准备
 
@@ -134,9 +134,6 @@ options:
                         When not set, the default is determined by --scheme. (default: None)
 ```
 
-> 截止到260529，llmcompressor支持的最高transformers版本为4\.57\.6，此版本还不支持Qwen3\.5系列模型，如果要对Qwen3\.5进行量化，需要在命令行添加\-\-alg model\_free\_ptq。
-> 
-> 
 
 # slimquant (w4a8)量化方法
 
