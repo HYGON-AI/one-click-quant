@@ -716,10 +716,10 @@ if __name__ == "__main__":
         """,
     )
     parser.add_argument("--src", type=Path,
-                        default=Path("/mnt/c/chl/models/Kimi-K3-FP8-DYNAMIC"),
+                        default=Path("/models/Kimi-K3-FP8-DYNAMIC"),
                         help="源模型目录")
     parser.add_argument("--dst", type=Path,
-                        default=Path("/mnt/c/chl/models/Kimi-K3-Mini"),
+                        default=Path("/models/Kimi-K3-Mini"),
                         help="输出目录")
     parser.add_argument("--src-format", choices=["auto", "fp8", "mxfp4", "int4", "w4a16", "bf16"], default="auto",
                         help="源模型格式；auto 优先识别 w4a16，再识别 fp8 / packed / bf16")

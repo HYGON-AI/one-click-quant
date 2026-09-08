@@ -17,6 +17,13 @@ class Qwen35MoeAdapter(ModelAdapter):
     def prepare_config(self, config: Any, world_size: int) -> None:
         config.ep_size = world_size
 
+    def validate_quantization_args(self, args: Any) -> None:
+        if args.bits != 4:
+            raise ValueError(
+                "Qwen3.5/3.8 MoE currently supports only --bits 4 (W4A16); MTP FP8 handling "
+                "is not validated for 8-bit."
+            )
+
     def prepare_model(self, model, config: Any, dtype) -> None:
         # Keep the structural conversion and forward compatibility code in the
         # existing Qwen-specific utility module.
