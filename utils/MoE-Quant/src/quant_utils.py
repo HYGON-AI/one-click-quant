@@ -95,9 +95,19 @@ def find_quantization_meta(
     x_max = x.amin(dim=-1)
 
     if symmetric:
-        scale = (2.0 / maxq) * torch.maximum(x_min.abs(), x_max.abs())
+        # Signed-symmetric quant. Use qmax_pos = 2^(bits-1) - 1 as the true
+        # symmetric quant limit ！ the previous formula `scale = 2，absmax/maxq`
+        # is asymmetric-unsigned dressed as symmetric: on W4 it clipped
+        # positive extremes to 7，s = 14/15，absmax while negatives could
+        # overshoot to -8，s = -16/15，absmax. Result was a systematic ~6.7%
+        # magnitude asymmetry between W4 and W8 dequants from the same fp32
+        # source. With the fix, both W4 and W8 dequant round-trip ＼absmax
+        # exactly (up to bf16 scale rounding); code 0 becomes an unused
+        # sentinel (would represent -qmax_pos-1 ， scale, outside data range).
+        qmax_pos = (maxq - 1) / 2                                      # W4=7, W8=127
+        scale = torch.maximum(x_min.abs(), x_max.abs()) / qmax_pos
         scale = round_fp(scale + epsilon, dtype)  # (...)
-        qzero = torch.full_like(scale, ((maxq + 1.0) * 0.5).item())  # (...)
+        qzero = torch.full_like(scale, ((maxq + 1.0) * 0.5).item())    # W4=8, W8=128
     else:
         scale = round_fp((x_max - x_min) / maxq + epsilon, dtype)  # (...)
         qzero = (-x_min / scale).round().clamp(0, maxq)  # (...)
