@@ -66,7 +66,16 @@ def pack_weight(
     bits: int,
     sym: bool,
     group_size: Optional[int] = None,
+    packing_format: str = "pack-quantized",
 ) -> dict[torch.Tensor]:
+    """Convert (qweight, scale, zero) into on-disk compressed-tensors artifacts.
+
+    packing_format:
+      - "pack-quantized": pack qweight into int32 lanes (compressed-tensors
+        WNA16 method; used for both W4A16 and W8A16).
+      - "int-quantized": emit qweight as plain int8 (compressed-tensors
+        W8A8Int8 method; only valid for bits == 8).
+    """
     compressed_data = {}
     qweight, scale, zero = weight['qweight'], weight['scale'], weight['zero']
     if qweight.ndim != 2:
@@ -89,9 +98,34 @@ def pack_weight(
             f"{expected_meta_shape}, got scale={tuple(scale.shape)} and "
             f"zero={tuple(zero.shape)}."
         )
-    qweight_shifted = qweight.to(torch.int8) - zero.repeat_interleave(
-        effective_group_size, dim=-1
+    # 在 int32 里做减法，最后再 cast 回 int8：
+    #   - qweight 是 uint8 ∈ [0, 2**bits - 1]；.to(int8) 对 b=8 值 128..255 会 wrap，行为依赖平台。
+    #   - zero 是 bf16 标量常数（对称量化下 =(maxq+1)/2，b=4 时 8.0，b=8 时 128.0）；
+    #     bf16(128.0).to(int8) 在现代 PyTorch/CUDA 会饱和到 127，导致 W8A16 每个权重被系统性偏移 +scale。
+    #   在 int32 做减法可以避开这两处溢出；结果由对称量化保证 ∈ [-128, 127]，最后 .to(int8) 无损。
+    qweight_shifted = (
+        qweight.to(torch.int32)
+        - zero.repeat_interleave(effective_group_size, dim=-1).to(torch.int32)
     ).to(torch.int8)
+
+    if packing_format == "int-quantized":
+        if bits != 8:
+            raise ValueError(
+                f"int-quantized format only supports 8-bit weights, got bits={bits}."
+            )
+        if not sym:
+            raise ValueError("int-quantized format requires symmetric quantization.")
+        compressed_data = {
+            "weight": qweight_shifted.contiguous(),
+            "weight_scale": scale,
+        }
+        return compressed_data
+
+    if packing_format != "pack-quantized":
+        raise ValueError(
+            f"Unknown packing_format {packing_format!r}; expected "
+            "'pack-quantized' or 'int-quantized'."
+        )
     qweight_packed = pack_to_int32(qweight_shifted, bits)
     compressed_data = {
         "weight_packed": qweight_packed,
@@ -101,6 +135,14 @@ def pack_weight(
     if not sym:
         compressed_data["weight_zero_point"] = weight['zero']
     return compressed_data
+
+
+def _packing_format_for(args: argparse.Namespace) -> str:
+    """Choose the compressed-tensors on-disk format for the current recipe."""
+    if args.activation_bits == 8:
+        # vLLM's CompressedTensorsW8A8Int8MoEMethod expects `int-quantized`.
+        return "int-quantized"
+    return "pack-quantized"
 
 
 def prepare_quantization_config(
@@ -122,7 +164,13 @@ def prepare_quantization_config(
 
     ignore_rule, ignored_modules = adapter.get_quantization_ignore(args.quantize_only_experts)
     weight_strategy = "channel" if args.group_size is None else "group"
+    # Channel-wise is expressed on disk as `-1` (compressed-tensors canonical
+    # sentinel). vLLM's CompressedTensorsWNA16MoEMethod reads the value
+    # verbatim and asserts `== -1` for 8-bit, so `null` breaks W8A16 loading.
+    canonical_group_size = args.group_size if args.group_size is not None else -1
+    packing_format = _packing_format_for(args)
     print(f"[INFO] quantization_config ignore rule={ignore_rule}, count={len(ignored_modules)}")
+    print(f"[INFO] quantization_config format={packing_format}")
     return {
         "config_groups": {
             "group_0": {
@@ -135,7 +183,7 @@ def prepare_quantization_config(
                     "actorder": None,
                     "block_structure": None,
                     "dynamic": False,
-                    "group_size": args.group_size,
+                    "group_size": canonical_group_size,
                     "num_bits": args.bits,
                     "observer": "minmax",
                     "observer_kwargs": {},
@@ -145,7 +193,7 @@ def prepare_quantization_config(
                 }
             }
         },
-        "format": "pack-quantized",
+        "format": packing_format,
         "ignore": ignored_modules,
         "kv_cache_scheme": None,
         "quant_method": "compressed-tensors",
@@ -181,6 +229,8 @@ def main():
     # Currently we do not support asymmetric quantization
     args.sym = True
     adapter.validate_packing_args(args)
+    packing_format = _packing_format_for(args)
+    print(f"[INFO] packing_format={packing_format}")
 
     # Resolve input weights through the HuggingFace safetensors index instead of
     # assuming DeepSeek's model-xxxxx-of-000163 naming convention.
@@ -304,7 +354,13 @@ def main():
                 weights_only=True,
                 map_location="cpu"
             )
-            packed_weight_state_dict = pack_weight(weight_state_dict, args.bits, args.sym, args.group_size)
+            packed_weight_state_dict = pack_weight(
+                weight_state_dict,
+                args.bits,
+                args.sym,
+                args.group_size,
+                packing_format=packing_format,
+            )
             block_state_dict.pop(f"{layer_name}.weight", None)
             block_state_dict.pop(f"{layer_name}.weight_scale_inv", None)
             block_state_dict.update({f"{layer_name}.{k}": v for k, v in packed_weight_state_dict.items()})

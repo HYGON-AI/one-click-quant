@@ -3,7 +3,7 @@
 加载 Kimi K3 mini 模型，运行 forward pass 推理验证。
 
 用法：
-  python test_mini_kimi_k3.py --model /mnt/c/chl/models/Kimi-K3-Mini
+  python test_mini_kimi_k3.py --model /models/Kimi-K3-Mini
 
 验证内容：
   1. 模型能否通过 from_pretrained 正常加载
@@ -177,7 +177,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("/mnt/c/chl/models/Kimi-K3-Mini"),
+        default=Path("/models/Kimi-K3-Mini"),
         help="Mini 模型路径",
     )
     parser.add_argument(

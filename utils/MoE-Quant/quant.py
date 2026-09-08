@@ -43,8 +43,8 @@ def parse_args():
         "--bits",
         type=int,
         default=4,
-        choices=[4],
-        help="Quantization bitwidth.",
+        choices=[4, 8],
+        help="Quantization bitwidth. Each adapter re-validates the bit widths it supports.",
     )
     parser.add_argument(
         "--group_size",

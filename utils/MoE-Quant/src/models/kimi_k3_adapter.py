@@ -68,6 +68,11 @@ class KimiK3Adapter(ModelAdapter):
             )
 
     def validate_quantization_args(self, args: Any) -> None:
+        if args.bits != 4:
+            raise ValueError(
+                "Kimi-K3 currently supports only --bits 4 (W4A16); the MXFP4 recompression path "
+                "is not validated for 8-bit."
+            )
         if not args.quantize_only_experts:
             raise ValueError(
                 "Kimi-K3 currently requires --quantize_only_experts; its SGLang "

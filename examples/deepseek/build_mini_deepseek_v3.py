@@ -13,8 +13,8 @@
 
 用法：
   python3 build_mini_deepseek_v3.py \
-    --src /mnt/c/chl/models/DeepSeek-V3 \
-    --dst /mnt/c/chl/models/DeepSeek-V3-Mini \
+    --src /models/DeepSeek-V3 \
+    --dst /models/DeepSeek-V3-Mini \
     -n 4 -e 8
 
 建议：
@@ -519,8 +519,8 @@ def main():
         description="构建 DeepSeek-V3 mini 模型（支持 FP8 block / W4A16 → BF16）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--src", type=str, default="/mnt/c/chl/models/DeepSeek-V3", help="源模型目录")
-    parser.add_argument("--dst", type=str, default="/mnt/c/chl/models/DeepSeek-V3-Mini", help="输出目录")
+    parser.add_argument("--src", type=str, default="/models/DeepSeek-V3", help="源模型目录")
+    parser.add_argument("--dst", type=str, default="/models/DeepSeek-V3-Mini", help="输出目录")
     parser.add_argument(
         "--src-format",
         choices=["auto", "fp8", "fp8-block", "w4a16", "bf16"],

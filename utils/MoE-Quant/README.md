@@ -47,4 +47,5 @@ python pack_quantized_model.py \
 - DeepSeek-V3 (DeepseekV3ForCausalLM)
 - Qwen3.8-2.4T-A95B-FP8 (Qwen3_5MoeForCausalLM)
 - Kimi-K3 (KimiK3ForConditionalGeneration)
+- GLM-5.3 (GlmMoeDsaForCausalLM)
 

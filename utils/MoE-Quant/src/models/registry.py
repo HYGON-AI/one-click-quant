@@ -4,6 +4,7 @@ from typing import Any, List, Type
 
 from .base import ModelAdapter
 from .deepseek_v3_adapter import DeepSeekV3Adapter
+from .glm_moe_dsa_adapter import GlmMoeDsaAdapter
 from .kimi_k3_adapter import KimiK3Adapter
 from .qwen3_5_moe_adapter import Qwen35MoeAdapter
 
@@ -11,6 +12,7 @@ from .qwen3_5_moe_adapter import Qwen35MoeAdapter
 # More specific adapters must appear before less specific adapters.
 _ADAPTER_CLASSES: List[Type[ModelAdapter]] = [
     KimiK3Adapter,
+    GlmMoeDsaAdapter,
     Qwen35MoeAdapter,
     DeepSeekV3Adapter,
 ]
@@ -27,13 +29,15 @@ def get_model_adapter(config: Any) -> ModelAdapter:
         f"model_type={getattr(config, 'model_type', None)!r}, "
         f"architectures={getattr(config, 'architectures', None)!r}. "
         "MoE-Quant currently supports DeepSeek-V3-style models, "
-        "Qwen3.5/Qwen3.8 MoE text models, and Kimi-K3."
+        "Qwen3.5/Qwen3.8 MoE text models, GLM-5.3 (glm_moe_dsa), and Kimi-K3."
     )
 
 
 __all__ = [
     "ModelAdapter",
     "DeepSeekV3Adapter",
+    "GlmMoeDsaAdapter",
+    "KimiK3Adapter",
     "Qwen35MoeAdapter",
     "get_model_adapter",
 ]
