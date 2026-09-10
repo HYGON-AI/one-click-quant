@@ -12,6 +12,11 @@ echo "Log file: ${LOG_FILE}"
 export MODEL_PATH="${MODEL_PATH:-/models/GLM-5.3}"
 echo "model: ${MODEL_PATH}"
 
+#  --no-enable-prefix-caching \
+#  --max-num-seqs 1 \
+#  --no-enable-chunked-prefill \
+#  --gpu_memory_utilization 0.95 \
+
 PYTHONUNBUFFERED=1 HF_DATASETS_OFFLINE=1 \
   vllm serve "${MODEL_PATH}" \
   --tensor-parallel-size 8 \
@@ -21,7 +26,7 @@ PYTHONUNBUFFERED=1 HF_DATASETS_OFFLINE=1 \
   --reasoning-parser glm45 \
   --enforce-eager \
   --speculative-config '{"method":"mtp","num_speculative_tokens":5}' \
-  --max-model-len 262144 \
+  --max-model-len 32768 \
   --cpu-offload-gb 48 \
   --generation-config vllm \
   2>&1 | tee "${LOG_FILE}"
