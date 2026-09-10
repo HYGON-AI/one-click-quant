@@ -48,4 +48,5 @@ python pack_quantized_model.py \
 - Qwen3.8-2.4T-A95B-FP8 (Qwen3_5MoeForCausalLM)
 - Kimi-K3 (KimiK3ForConditionalGeneration)
 - GLM-5.3 (GlmMoeDsaForCausalLM)
+- GLM-5.3-Flash (Glm5NextForConditionalGeneration)
 
