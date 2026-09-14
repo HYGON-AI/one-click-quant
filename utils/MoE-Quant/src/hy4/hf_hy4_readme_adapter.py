@@ -78,7 +78,8 @@ class HFHy4ReadmeAdapter(ModelAdapter):
         # silently applying its global Linear selection or W4A16 defaults.
         required = dict(bits=4, group_size=None, sym=True, dtype='bfloat16',
             quantize_scope='routed_shared_experts', include_mtp=True,
-            activation_bits=8, weight_range='narrow')
+            activation_bits=8, weight_range='narrow', rel_damp=0.01,
+            block_size=128, quantization_scale='absmax', quantization_order='default')
         for name, expected in required.items():
             if getattr(args, name, None) != expected:
                 raise ValueError(f'Hy4 requires {name}={expected!r}')

@@ -101,7 +101,7 @@ class CheckpointWriter:
             raise ValueError('Uncommitted shard exists; preserve and inspect before recovery')
         tmp=self.root/(filename+'.tmp')
         save_file(self.pending,str(tmp))
-        with tmp.open('rb') as f: os.fsync(f.fileno())
+        with tmp.open('rb+') as f: os.fsync(f.fileno())
         with safe_open(tmp,framework='pt',device='cpu') as f:
             if set(f.keys())!=set(self.pending): raise ValueError('Shard write mismatch')
         checksum=digest(tmp); tmp.replace(path)

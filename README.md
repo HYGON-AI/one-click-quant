@@ -9,6 +9,7 @@
 - [强制使用某个量化算法](#强制使用某个量化算法)
 - [slimquant(w4a8)量化方法](#slimquant-w4a8量化方法)
 - [MoE-Quant(单机大权重gptq量化)](/utils/MoE-Quant/README.md)
+  - [Hy4 主干＋MTP GPTQ 与 W4A8 推理](utils/MoE-Quant/README.hy4.md)
 - [PPL评估](#ppl评估)
 - [精度调优](/docs/precision-tuning.md)
 - [提交PR](#提交pr)

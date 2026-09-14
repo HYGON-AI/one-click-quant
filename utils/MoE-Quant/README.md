@@ -49,4 +49,5 @@ python pack_quantized_model.py \
 - Kimi-K3 (KimiK3ForConditionalGeneration)
 - GLM-5.3 (GlmMoeDsaForCausalLM)
 - GLM-5.3-Flash (Glm5NextForConditionalGeneration)
+- Hy4-preview 主干＋MTP（HYV4ForCausalLM）：channel-wise GPTQ、自定义 W4A8 检查点及专用 SGLang 推理；使用限制和独立命令见 [Hy4 文档](README.hy4.md)，不要直接套用上面的通用 group-wise 示例。
 

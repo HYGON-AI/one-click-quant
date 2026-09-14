@@ -8,7 +8,7 @@ import torch
 from safetensors import safe_open
 
 class Hy4Source:
-    def __init__(self, root='/source', manifest='/work/reports/target-manifest.json'):
+    def __init__(self, root, manifest):
         self.root=Path(root).resolve()
         self.index=json.loads((self.root/'model.safetensors.index.json').read_text())['weight_map']
         self.config=json.loads((self.root/'config.json').read_text())
@@ -97,16 +97,70 @@ class Hy4Source:
                 continue
             yield name,self.tensor(name)
 
-if __name__=='__main__':
+def build_manifest(root):
+    """Inspect tensor headers without reading BF16 payloads."""
     import hashlib
-    src=Hy4Source()
-    records=[]
-    for prefix in ('model.layers.1','model.mtp_layers.0'):
-        for suffix in ('experts.0.gate_proj','experts.0.up_proj','experts.0.down_proj','shared_experts.gate_proj'):
-            name=f'{prefix}.mlp.{suffix}.weight'
-            w=src.projection(name)
-            assert torch.isfinite(w).all()
-            records.append(dict(name=name,shape=list(w.shape),dtype=str(w.dtype),
-                sha256=hashlib.sha256(w.view(torch.uint8).numpy().tobytes()).hexdigest()))
-    Path('/work/reports/real-projection-read.json').write_text(json.dumps(records,indent=2))
-    print('REAL_MAIN_AND_MTP_PROJECTIONS_READ; NO_CALIBRATION_OR_QUANTIZATION')
+    root = Path(root).resolve()
+    raw = (root / 'model.safetensors.index.json').read_bytes()
+    index = json.loads(raw)['weight_map']
+    config = json.loads((root / 'config.json').read_text())
+    if config['num_hidden_layers'] != 78 or config['num_nextn_predict_layers'] != 1:
+        raise ValueError('Expected Hy4 78+1 layout')
+    headers = {}
+    for filename in sorted(set(index.values())):
+        path = (root / filename).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError('Shard escapes source')
+        with path.open('rb') as stream:
+            n = struct.unpack('<Q', stream.read(8))[0]
+            if not 0 < n <= 64 << 20:
+                raise ValueError('Invalid header length')
+            header = json.loads(stream.read(n))
+        for name, spec in header.items():
+            if name != '__metadata__':
+                if name in headers or index.get(name) != filename:
+                    raise ValueError('Duplicate/mismatched tensor inventory')
+                headers[name] = spec
+    if set(headers) != set(index):
+        raise ValueError('Incomplete source header inventory')
+    h, m, e = config['hidden_size'], config['moe_intermediate_size'], config['n_routed_experts']
+    targets, used = [], set()
+    prefixes = ['model.layers.' + str(i) for i in range(1, 78)] + ['model.mtp_layers.0']
+    for prefix in prefixes:
+        for part in ('gate', 'up', 'down'):
+            key = prefix + '.mlp.experts.' + ('down_proj' if part == 'down' else 'gate_up_proj')
+            shape = [e, h, m] if part == 'down' else [e, 2*m, h]
+            if headers[key]['dtype'] != 'BF16' or headers[key]['shape'] != shape:
+                raise ValueError('Unexpected expert bank: ' + key)
+            used.add(key)
+            for expert in range(e):
+                targets.append(dict(name=f'{prefix}.mlp.experts.{expert}.{part}_proj.weight',
+                    source=key, expert=expert, row_start=m if part == 'up' else 0,
+                    rows=h if part == 'down' else m, columns=m if part == 'down' else h))
+            key = prefix + '.mlp.shared_experts.' + part + '_proj.weight'
+            shape = [h, m*config['n_shared_experts']] if part == 'down' else [m*config['n_shared_experts'], h]
+            if headers[key]['dtype'] != 'BF16' or headers[key]['shape'] != shape:
+                raise ValueError('Unexpected shared projection: ' + key)
+            used.add(key)
+            targets.append(dict(name=key, source=key, expert=None, row_start=0,
+                                rows=shape[0], columns=shape[1]))
+    return dict(format='hy4-target-manifest-v1', source_index_sha256=hashlib.sha256(raw).hexdigest(),
+                targets=targets, preserved=sorted(set(index)-used), logical_projections=len(targets),
+                physical_target_tensors=len(used),
+                mtp_projections=sum('.mtp_layers.' in t['name'] for t in targets))
+
+
+if __name__ == '__main__':
+    import argparse
+    from .checkpoint_writer import atomic_json
+    parser = argparse.ArgumentParser(description='Create an explicit Hy4 target manifest from source headers')
+    parser.add_argument('--model', required=True)
+    parser.add_argument('--manifest', required=True)
+    args = parser.parse_args()
+    output = Path(args.manifest)
+    if output.exists():
+        raise ValueError('Refusing to overwrite an existing manifest')
+    result = build_manifest(args.model)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(output, result)
+    print(json.dumps({k: result[k] for k in ('logical_projections', 'physical_target_tensors', 'mtp_projections')}))
