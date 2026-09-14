@@ -19,6 +19,9 @@ from src.models import ModelAdapter, get_model_adapter
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--hy4-target-manifest')
+    parser.add_argument('--hy4-calibration-manifest')
+    parser.add_argument('--preflight',action='store_true')
     # Model params
     parser.add_argument(
         "--model_name_or_path",
@@ -203,6 +206,15 @@ def prepare_quantization_config(
 
 def main():
     args = parse_args()
+    # Branch before legacy metadata.pt loading / compressed-tensors selection.
+    # Only this explicitly versioned Hy4 native-loop input gets the custom
+    # integer-runtime format. Existing W4A16 and W8A8 paths remain unchanged.
+    from pathlib import Path
+    native_run=Path(args.quantized_model_path)/'native-run.json'
+    if native_run.is_file():
+        from src.hy4.hf_hy4_pack import pack
+        print(json.dumps(pack(args),indent=2))
+        return
 
     dtype = getattr(torch, args.dtype)
 
