@@ -1,6 +1,7 @@
 import os
 import gc
 import argparse
+import time
 from dataclasses import dataclass
 
 from tqdm import tqdm
@@ -22,6 +23,17 @@ from src.models import get_model_adapter
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--quantize_scope', choices=['routed_shared_experts'])
+    parser.add_argument('--include_mtp', action='store_true')
+    parser.add_argument('--activation_bits', type=int, choices=[8])
+    parser.add_argument('--weight_range', choices=['narrow'])
+    parser.add_argument('--calibration_manifest')
+    parser.add_argument('--hessian_budget_gib', type=float, default=44.0)
+    parser.add_argument('--stop_after_layer', type=int, default=None,
+                        help='Commit this layer and stop; incomplete candidate, not a full model.')
+    parser.add_argument('--gpu_memory_budget_gib', type=float, default=64.0)
+    parser.add_argument('--disk_reserve_gib', type=float, default=300.0)
+    parser.add_argument('--stage_disk_headroom_gib', type=float, default=50.0)
     # Model params
     parser.add_argument(
         "--model_name_or_path",
@@ -139,6 +151,7 @@ class CalibrationContext:
     inputs: list
     position_ids: list
     block_states: list
+    frozen_identity: dict | None = None
 
 
 def initialize_runtime(args):
@@ -153,6 +166,11 @@ def initialize_runtime(args):
     device = f"cuda:{rank}"
     torch.set_grad_enabled(False)
     torch.cuda.set_device(device)
+    if args.gpu_memory_budget_gib <= 0:
+        raise ValueError('Positive GPU memory budget required')
+    capacity = torch.cuda.get_device_properties(device).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1.0,args.gpu_memory_budget_gib*(1<<30)/capacity),device)
+    torch.manual_seed(args.seed)
     offload_device = "cpu" if args.offload_activations else None
     dtype = getattr(torch, args.dtype)
     # Init W&B logger
@@ -180,6 +198,15 @@ def build_model_context(args, runtime):
 
 def prepare_calibration_context(args, runtime, model_context):
     print("[INFO] Preparing calibration dataset...")
+    if getattr(model_context.adapter, 'name', None) == 'hy4_hf_main_mtp':
+        from src.hy4.hf_hy4_frozen_data import load
+        if not args.calibration_manifest:
+            raise ValueError('Hy4 requires --calibration_manifest')
+        dataset, identity = load(args.calibration_manifest, args.model_name_or_path,
+            args.dataset_name_or_path, runtime.rank, runtime.world_size,
+            args.num_calibration_samples, args.max_sequence_length)
+        dist_utils.barrier(device_ids=[runtime.rank])
+        return CalibrationContext(dataset, len(dataset), [], [], [], identity)
     dataset = data_utils.prepare_calibration_dataset(
         args.dataset_name_or_path, model_context.tokenizer, args.max_sequence_length,
         args.num_calibration_samples, args.seed
@@ -193,6 +220,9 @@ def prepare_calibration_context(args, runtime, model_context):
 
 def prepare_checkpoint_context(args, runtime, model_context):
     checkpoint = CheckpointContext(args.model_name_or_path, {})
+    if getattr(model_context.adapter, 'name', None) == 'hy4_hf_main_mtp':
+        # Each rank loads only the current final storage; no full shard buffer.
+        return checkpoint
     if dist_utils.is_main():
         checkpoint.weight_map = loading_utils.load_safetensors_weight_map(checkpoint.weight_dir)
         checkpoint.loaded_shards = set()
@@ -210,6 +240,16 @@ def initialize_embeddings(args, runtime, model_context, calibration, checkpoint)
     adapter = model_context.adapter
     embedding_module = adapter.get_embedding_module(model_context.model)
     embedding_module.to_empty(device=runtime.device)
+    if getattr(adapter, 'name', None) == 'hy4_hf_main_mtp':
+        from src.hy4.hf_hy4_source_loader import SourceLoader
+        SourceLoader(args.model_name_or_path).load(embedding_module, 'model.embed_tokens.')
+        for tokens in calibration.dataset:
+            calibration.inputs.append(embedding_module(tokens.to(runtime.device)).to(runtime.offload_device))
+            calibration.position_ids.append(torch.arange(tokens.shape[1], device=runtime.device).unsqueeze(0))
+        embedding_module.to(device='meta')
+        calibration.block_states = [adapter.create_block_state(hidden, positions.to(hidden.device))
+            for hidden, positions in zip(calibration.inputs, calibration.position_ids)]
+        return
     if dist_utils.is_main():
         embedding_state_dict = loading_utils.materialize_model_state_dict(
             checkpoint.param_buffer,
@@ -242,6 +282,16 @@ def initialize_embeddings(args, runtime, model_context, calibration, checkpoint)
 
 
 def collect(block, prefix, model, args, adapter, inputs, position_ids, block_states, device, rank):
+    if getattr(adapter, 'name', None) == 'hy4_hf_main_mtp':
+        from src.hy4.hf_hy4_collect import collect as collect_hy4
+        def forward_documents():
+            for hidden, positions, state in zip(inputs, position_ids, block_states):
+                adapter.forward_block(block, hidden.to(device), positions.to(device),
+                                      adapter.move_block_state(state, device))
+        handles = collect_hy4(block, prefix, args, forward_documents,
+                             int(args.hessian_budget_gib * (1 << 30)))
+        dist_utils.barrier(device_ids=[rank])
+        return handles, {}
     layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
     handles = {}
     hooks = {}
@@ -276,7 +326,7 @@ def collect(block, prefix, model, args, adapter, inputs, position_ids, block_sta
 
     for i in range(len(inputs)):
         adapter.forward_block(
-            block, inputs[i].to(device), position_ids[i],
+            block, inputs[i].to(device), position_ids[i].to(device),
             adapter.move_block_state(block_states[i], device),
         )
     for hook in hooks.values():
@@ -295,7 +345,7 @@ def quantize(handle, bits):
 def propagate(block, adapter, inputs, position_ids, block_states, device, offload_device):
     for i in range(len(inputs)):
         next_inputs, next_state = adapter.forward_block(
-            block, inputs[i].to(device), position_ids[i],
+            block, inputs[i].to(device), position_ids[i].to(device),
             adapter.move_block_state(block_states[i], device),
         )
         inputs[i] = next_inputs.to(offload_device)
@@ -329,6 +379,10 @@ def cleanup_runtime():
 def run(args):
     runtime = initialize_runtime(args)
     model_context = build_model_context(args, runtime)
+    if getattr(model_context.adapter, 'name', None) == 'hy4_hf_main_mtp':
+        if args.stop_after_layer is not None and not 0 <= args.stop_after_layer < 79:
+            raise ValueError('stop_after_layer must be within the 78+1 Hy4 layer sequence')
+        print('[Hy4 native] candidate conversion only; full runtime/accuracy NOT_EVALUATED',flush=True)
     calibration = prepare_calibration_context(args, runtime, model_context)
     checkpoint = prepare_checkpoint_context(args, runtime, model_context)
     return process(args, runtime, model_context, calibration, checkpoint)
@@ -518,27 +572,55 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
     dtype = runtime.dtype
     adapter = model_context.adapter
     model = model_context.model
+    hy4_native = getattr(adapter, 'name', None) == 'hy4_hf_main_mtp'
+    run_identity = None
+    if hy4_native:
+        from src.hy4.hf_hy4_run_state import prepare as prepare_run
+        run_identity, resume_block_idx = prepare_run(args, calibration, model.config.num_hidden_layers, __file__)
+    else:
+        resume_block_idx = get_resume_block_idx(args.save_dir, adapter) if args.resume else 0
+    if not hy4_native or resume_block_idx == 0:
+        initialize_embeddings(args, runtime, model_context, calibration, checkpoint)
     inputs = calibration.inputs
     position_ids = calibration.position_ids
-    resume_block_idx = get_resume_block_idx(args.save_dir, adapter) if args.resume else 0
-    initialize_embeddings(args, runtime, model_context, calibration, checkpoint)
     block_states = calibration.block_states
 
     transformer_layers = adapter.get_transformer_layers(model)
     for block_idx, block in tqdm(
         enumerate(transformer_layers), desc="Processing transformer blocks", total=len(transformer_layers)
     ):
+        if hy4_native and block_idx < resume_block_idx:
+            continue
+        if hy4_native and args.stop_after_layer is not None and block_idx > args.stop_after_layer:
+            break
         prefix = adapter.get_layer_prefix(block_idx)
+        if hy4_native:
+            from src.hy4.hf_hy4_resource_budget import check as check_resource_budget
+            check_resource_budget(args.save_dir,args.disk_reserve_gib,args.stage_disk_headroom_gib)
+        stage_start=time.monotonic()
+        if hy4_native:
+            print(f'[Hy4 native rank {rank}] layer={block_idx} stage=load',flush=True)
+        if hy4_native and block_idx == model.config.num_hidden_layers:
+            from src.hy4.hf_hy4_mtp_stage import prepare as prepare_mtp_stage
+            prepare_mtp_stage(adapter, model, calibration, args.model_name_or_path,
+                              device, offload_device)
+            inputs = calibration.inputs
+            position_ids = calibration.position_ids
+            block_states = calibration.block_states
         # Collect state dict keys from all processes
-        rank_block_keys, block_keys_with_prefix, other_ranks_keys, has_routed_experts = prepare_block_keys(
-            block_idx, block, prefix, world_size, checkpoint, adapter
-        )
+        if not hy4_native:
+            rank_block_keys, block_keys_with_prefix, other_ranks_keys, has_routed_experts = prepare_block_keys(
+                block_idx, block, prefix, world_size, checkpoint, adapter
+            )
 
         # Put block onto GPU
         block.to_empty(device=device)
 
         # Dense blocks are replicated on all ranks. MoE blocks may contain rank-local experts.
-        if not has_routed_experts:
+        if hy4_native:
+            adapter.load_current_block(block, block_idx, args.model_name_or_path)
+            print(f'[Hy4 native rank {rank}] layer={block_idx} stage=loaded elapsed={time.monotonic()-stage_start:.3f}s allocated_gib={torch.cuda.memory_allocated(device)/(1<<30):.3f}',flush=True)
+        elif not has_routed_experts:
             load_dense_block(block, prefix, block_keys_with_prefix, checkpoint, adapter, dtype)
         # Materialize one rank at a time so packed experts are never all expanded on rank 0.
         else:
@@ -557,10 +639,33 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
         gc.collect()
 
         if block_idx >= resume_block_idx:
+            if hy4_native:
+                print(f'[Hy4 native rank {rank}] layer={block_idx} stage=collect documents={len(inputs)}',flush=True)
             # Collect GPTQ Hessian statistics for the current block.
             handles, hooks = collect(
                 block, prefix, model, args, adapter, inputs, position_ids, block_states, device, rank
             )
+            if hy4_native:
+                from src.hy4.hf_hy4_layer_stage import quantize_and_save
+                print(f'[Hy4 native rank {rank}] layer={block_idx} stage=gptq projections={len(handles)}',flush=True)
+                quantize_and_save(handles, args, calibration, block_idx, rank, world_size)
+                del handles, hooks
+                torch.cuda.empty_cache()
+                print(f'[Hy4 native rank {rank}] layer={block_idx} stage=propagate',flush=True)
+                propagate(block, adapter, inputs, position_ids, block_states, device, offload_device)
+                release(block, prefix, checkpoint, runtime)
+                from src.hy4.hf_hy4_layer_commit import commit as commit_layer
+                from src.hy4.hf_hy4_run_state import status as save_native_status
+                commit_layer(args.save_dir, block_idx, calibration, run_identity)
+                print(f'[Hy4 native rank {rank}] layer={block_idx} stage=committed elapsed={time.monotonic()-stage_start:.3f}s peak_gib={torch.cuda.max_memory_allocated(device)/(1<<30):.3f}',flush=True)
+                resume_block_idx = block_idx + 1
+                save_native_status(args.save_dir, run_identity, resume_block_idx, len(transformer_layers))
+                dist_utils.print_on_main(f'[Hy4 native] globally committed layer {block_idx}; next={resume_block_idx}')
+                from src.hy4.hf_hy4_cache_retention import retire as retire_old_boundary
+                retired=retire_old_boundary(args.save_dir,block_idx,run_identity,args.model_name_or_path)
+                if retired:
+                    print(f'[Hy4 native rank {rank}] retired_reconstructible_cache_bytes={retired}',flush=True)
+                continue
             shared_handles = {k: v for k, v in handles.items() if not adapter.is_routed_expert(k)}
             expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
 
@@ -635,7 +740,8 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
         release(block, prefix, checkpoint, runtime)
 
-    save_quantization_metadata(args)
+    if not hy4_native:
+        save_quantization_metadata(args)
     cleanup_runtime()
 
 

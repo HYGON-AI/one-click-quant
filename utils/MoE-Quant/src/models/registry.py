@@ -22,6 +22,11 @@ _ADAPTER_CLASSES: List[Type[ModelAdapter]] = [
 
 def get_model_adapter(config: Any) -> ModelAdapter:
     """Select an adapter from a Transformers config."""
+    # Lazy import: other architectures must not require Hy4's Transformers build.
+    if getattr(config, 'model_type', None) == 'hy_v4':
+        from ..hy4.hf_hy4_readme_adapter import HFHy4ReadmeAdapter
+        if HFHy4ReadmeAdapter.matches(config):
+            return HFHy4ReadmeAdapter(config)
     for adapter_class in _ADAPTER_CLASSES:
         if adapter_class.matches(config):
             return adapter_class(config)
