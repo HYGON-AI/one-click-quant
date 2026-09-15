@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """GLM-MoE-DSA structural and checkpoint utilities.
 
 The upstream GLM implementation packs routed experts into 3-D parameters, while

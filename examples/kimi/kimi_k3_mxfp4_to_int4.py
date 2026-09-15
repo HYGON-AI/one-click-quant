@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 Convert Kimi-K3 MXFP4 expert weights to INT4 (per-channel symmetric, nibble-packed).
 

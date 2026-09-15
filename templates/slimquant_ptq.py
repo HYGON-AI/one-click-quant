@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 SlimQuant PTQ template -- data-free per-channel quantization supporting INT4/INT8/FP8.
 
