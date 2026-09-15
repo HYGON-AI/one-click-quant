@@ -1,3 +1,10 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Portions of this file are backported from compressed-tensors
+# (https://github.com/vllm-project/compressed-tensors),
+# Copyright (c) the vLLM project, licensed under the Apache License, Version 2.0.
+# See THIRD_PARTY_NOTICES.md for the pinned source and modification record.
 """
 Vendor module — backports of compressed_tensors functions that may not be
 available in all installed versions (e.g. v0.15.0.1 lacks some entrypoints).

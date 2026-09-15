@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 DeepSeek-V4.1-Flash FP4/FP8 block -> FP8 channelwise 转换脚本
 

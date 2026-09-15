@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 # ─────────────────────────────────────────────────────────────────────────────
 # GLM-5.3 W8A16 级联精度扫描脚本（原始 fp8-block vs MoE-Quant W8A16 packed）
 #
@@ -319,11 +321,10 @@ for range in "${RANGE_ARR[@]}"; do
         cmp_log="${LOG_DIR}/cmp_${range_tag}.log"
 
         # 首段（start=0）没有上一段的 hs 文件，不传 --load-embeds-prefix
+        embeds_args=()
         if [[ -n "$prev_end" ]]; then
             prev_ep=$(embeds_prefix "$prev_start" "$prev_end")
-            embeds_args="--load-embeds-prefix ${prev_ep}"
-        else
-            embeds_args=""
+            embeds_args=(--load-embeds-prefix "$prev_ep")
         fi
 
         # 是否加 --fix-routing
@@ -338,10 +339,10 @@ for range in "${RANGE_ARR[@]}"; do
             python3 "$COMPARE" \
                 --model-a "$dir_orig" \
                 --model-b "$dir_w8a16" \
-                --cascade $fix_routing_arg --dump-per-layer \
+                --cascade ${fix_routing_arg:+"$fix_routing_arg"} --dump-per-layer \
                 --cpu-convert-then-dispatch \
                 --save-embeds-dir "$EMBEDS_DIR" \
-                $embeds_args
+                "${embeds_args[@]}"
         } > "$cmp_log" 2>&1 || compare_status="fail"
         cat "$cmp_log" >> "$round_log"
 

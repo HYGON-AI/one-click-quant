@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 从 Kimi K3 量化输出（或原始 MXFP4）中提取子集，构建 mini 模型用于推理验证。
 

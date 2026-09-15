@@ -13,6 +13,7 @@
 - [精度调优](/docs/precision-tuning.md)
 - [提交PR](#提交pr)
 - [常见故障排查](#常见故障排查)
+- [许可证与第三方组件](#许可证与第三方组件)
 
 # 简介
 
@@ -215,4 +216,22 @@ python3 main.py --lm-eval "pretrained=/models/Qwen2.5-0.5B-Instruct-FP8_DYNAMIC,
     - 此功能为llmcompressor新特性，还不稳定，大于100B的模型量化，中途可能会遇到hang住问题，现象是所有GPU核都100%，量化进度卡着不更新。
 
     - 当模型权重大于100B时，建议N为2或4，设置为8可能会触发系统资源不足的相关错误，如shmem\-rss、vm\.max\_map\_count、cpu ram oom等。
+
+# 许可证与第三方组件
+
+本项目采用 **Apache License 2.0** 发布，完整许可证文本见仓库根目录的 [LICENSE.txt](LICENSE.txt)。
+
+第三方源码、第三方组件与数据资产的来源、固定版本、Copyright 和许可证信息，统一登记在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+选用第三方组件时仅使用 MIT、BSD\-2\-Clause、BSD\-3\-Clause、Apache\-2\.0、0BSD 等宽松许可证。
+
+## 文件头约定
+
+本仓库自有源码统一携带文件头（`#` 注释的文件直接使用；`//` 注释的文件替换注释符；shebang 必须保持第一行）：
+
+```text
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+```
+
+第三方原文件保留其原始声明，不追加本仓库版权头，仅在本仓库第三方清单中登记。
 

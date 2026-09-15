@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 GLM-5.3 量化精度对比测试（fp8-block 原始 vs W8A16 packed）
 

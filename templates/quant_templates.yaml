@@ -54,7 +54,7 @@ Qwen3_5MoeForConditionalGeneration:
 
 MiniMaxM2ForCausalLM:
   - hidden_size: 3072
-    num_hidden_layers: 62 # MiniMax-M2.5/MiniMax-M2.7
+    num_hidden_layers: 62  # MiniMax-M2.5/MiniMax-M2.7
     schemes:
       FP8_DYNAMIC:
         ignore: "lm_head,re:.*moe.gate$,re:.*moe.e_score_correction_bias$"
@@ -69,4 +69,3 @@ KimiK25ForConditionalGeneration:
       Kimi_W4_TO_FP8:
         template: "templates/w4_dequant_channel.py"
         quant_type: "fp8"
-

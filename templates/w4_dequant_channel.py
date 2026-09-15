@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 ## 核心逻辑：Group-INT4 (G32) -> BF16 -> Channel-FP8
 import os
 import argparse

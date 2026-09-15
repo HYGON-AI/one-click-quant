@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 Qwen3.5-MoE (Qwen3.8-2.4T-A95B-FP8) 适配工具。
 
