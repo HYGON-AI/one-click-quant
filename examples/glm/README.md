@@ -22,6 +22,13 @@
     --activation-bits 16
 ```
 
+### GLM-5.3-Channel-INT8-w8a8
+
+```bash
+  cd one-click-quant
+  python3 examples/glm/quantize_glm5_3_w8a8_channel.py --model-id /models/GLM-5.3 --save-dir /models/GLM-5.3-Channel-INT8-w8a8 --quantize-shared-experts
+```
+
 ### GLM-5.3-Flash-Channel-INT8-w8a8
 
 ```bash

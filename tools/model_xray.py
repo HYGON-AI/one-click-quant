@@ -45,7 +45,7 @@ def main():
         print("⚠️ 未找到任何 .safetensors 文件")
         return
 
-    print(f"📁 找到 {len(safetensors_files)} 个分片文件")
+    print(f"找到 {len(safetensors_files)} 个分片文件")
     for sf in safetensors_files:
         json_name = sf.stem + args.suffix
         json_path = output_dir / json_name
