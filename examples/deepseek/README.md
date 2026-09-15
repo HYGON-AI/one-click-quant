@@ -19,3 +19,14 @@ python3 examples/deepseek/mixed_w4a8_int4_attention_w8a8_int8_channel.py \
   --scale-divisor 16 \
   --num-threads 8
 ```
+
+### DeepSeek-V4.1-Flash-Channel-FP8-w8a8
+
+```bash
+cd one-click-quant
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-Channel-FP8-w8a8 \
+  --num-threads 32
+```
+
