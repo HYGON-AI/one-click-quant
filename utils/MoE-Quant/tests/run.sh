@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 LOG_DIR="./logs"
@@ -45,5 +47,5 @@ PYTHONUNBUFFERED=1 HF_DATASETS_OFFLINE=1 OMP_NUM_THREADS=32 \
   --save_dir "${SAVE_MODEL_PATH}" \
   2>&1 | tee "${LOG_FILE}"
 
-exit ${PIPESTATUS[0]}
+exit "${PIPESTATUS[0]}"
 

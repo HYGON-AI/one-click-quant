@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """
 从 Qwen3.8-2.4T-A95B-FP8 中提取子集，构建 mini 模型用于推理/量化链路验证。
 
@@ -31,9 +33,13 @@ import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # torch / safetensors / tqdm 在实际读取权重时再导入，
 # 这样 --dry-run 可在轻量环境中只验证 index 筛选逻辑。
+# 类型注解需要在静态检查阶段可见，因此仅在 TYPE_CHECKING 下导入。
+if TYPE_CHECKING:
+    import torch
 
 _LAYER_REMAP: dict[int, int] = {}
 

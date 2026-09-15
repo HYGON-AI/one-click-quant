@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """Qwen3.5/Qwen3.8 MoE model adapter."""
 
 from typing import Any, Dict

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash (glm5_next) structural utilities for MoE-Quant.
 
 The upstream Glm5NextTextExperts stores every routed expert as a slice of two
