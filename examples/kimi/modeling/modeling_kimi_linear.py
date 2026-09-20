@@ -21,6 +21,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# ---------------------------------------------------------------------------
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+#   - OutputRecorder import made tolerant of transformers>=5.2 (the symbol moved
+#     to transformers.utils.output_capturing).
+#   - Weight initialization guarded by dtype: normal_() is only applied to
+#     float32 / float16 / bfloat16, skipping quantized (e.g. float8) weights.
+#   - Default attention implementation changed from the upstream forced
+#     flash_attention_2 to eager, to avoid dynamic hub-kernel download and
+#     publisher trust checks in offline / intranet environments.
+#   - create_causal_mask() is called with the inputs_embeds signature used in
+#     this copy (upstream passes input_embeds together with cache_position).
+# Original copyright and license notices above are retained unmodified.
+# ---------------------------------------------------------------------------
 import math
 from collections.abc import Callable
 from typing import Any
