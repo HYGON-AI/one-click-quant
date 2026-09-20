@@ -12,4 +12,4 @@
 - Kimi K3 License **仅适用于**上表列出的两个文件；本仓库其他文件仍为 Apache-2.0。
 - 这两个文件同时包含 Apache-2.0 派生部分（llava、DeepSeek-V3），其原始声明一并保留，来源与修改记录详见第三方清单。
 - 上游该许可证条件 1 要求：所有副本或实质部分须包含版权声明与许可声明。因此本目录中的许可证全文**必须与上述两个文件一同分发**，不得单独删除。
-- 义务履行方式与批准结论见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) 第 1.2 节。
+- 来源、固定版本、Copyright 与修改记录见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。

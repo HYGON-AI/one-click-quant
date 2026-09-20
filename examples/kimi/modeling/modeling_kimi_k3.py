@@ -19,6 +19,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# ---------------------------------------------------------------------------
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+#   - Added transformers>=5.2 compatibility to tie_weights(): the new
+#     missing_keys / recompute_mapping arguments are dispatched by transformers
+#     version instead of being passed unconditionally.
+# Original copyright and license notices above are retained unmodified.
+# ---------------------------------------------------------------------------
 
 
 # NOTE: Reference implementation for model architecture; see the model card for production deployment.

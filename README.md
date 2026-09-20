@@ -228,8 +228,8 @@ python3 main.py --lm-eval "pretrained=/models/Qwen2.5-0.5B-Instruct-FP8_DYNAMIC,
 
 > **例外说明**：`examples/kimi/modeling/modeling_kimi_k3.py` 与 `examples/kimi/modeling/modeling_kimi_linear.py` 为第三方源码，
 > 其许可为 **Kimi K3 License**（其中 llava、DeepSeek-V3 派生部分为 Apache-2.0），**不适用本仓库的 Apache-2.0 授权**。
-> 许可证全文见 [LICENSES/Kimi-K3-License.txt](LICENSES/Kimi-K3-License.txt)；适用范围、上游固定 revision 与义务履行方式见
-> [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 第 1.2 节。这两个文件的原始版权与许可声明不得改写或删除。
+> 许可证全文见 [LICENSES/Kimi-K3-License.txt](LICENSES/Kimi-K3-License.txt)；适用范围、上游固定 revision 与来源登记见
+> [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。这两个文件的原始版权与许可声明不得改写或删除。
 >
 > 同样地，`datasets/EleutherAI___wikitext_document_level/` 数据集上游声明为 **CC BY-SA 3.0**，也不适用本仓库的 Apache-2.0 授权。
 
