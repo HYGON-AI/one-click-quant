@@ -469,9 +469,14 @@ class Glm5NextAdapter(ModelAdapter):
                     # the routed subtree, so this only affects dense blocks).
                     r"re:.*\.mlp\.gate_up_proj(?:\..*)?$",
                     r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
-                    # MTP layer 45 (next-n predict head, always BF16).
-                    r"re:.*\.language_model\.layers\.45(?:\..*)?$",
-                    r"re:^model\.language_model\.layers\.45(?:\..*)?$",
+                    # MTP layer 45 (next-n predict head, always BF16). The
+                    # `.*\.layers\.45` form covers both the multimodal path
+                    # (`model.language_model.layers.45.*`) and the text-only
+                    # path vLLM uses when building the MTP draft model, whose
+                    # prefix drops `language_model.`
+                    # (`model.layers.45.mtp_block.*`).
+                    r"re:.*\.layers\.45(?:\..*)?$",
+                    r"re:^model\.layers\.45(?:\..*)?$",
                     # Vision tower (BF16 in the source FP8 checkpoint).
                     r"re:.*visual(?:\..*)?$",
                 ]
