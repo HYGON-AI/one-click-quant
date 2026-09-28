@@ -567,7 +567,21 @@ def build_compression_config(mode: str, group_size: int) -> dict:
     """生成 compressed-tensors pack-quantized 配置 (W4A16 或 W4A8).
 
     targets 只匹配已解 pack + 拆开的 HF-style per-expert 2D experts:
-      (model.language_model|mtp).layers.{L}.mlp.experts.{E}.(gate_proj|up_proj|down_proj)
+      (model.language_model|language_model.model|mtp).layers.{L}
+        .mlp.experts.{E}.(gate_proj|up_proj|down_proj)
+
+    前缀说明 (需同时兼容 sglang 与 vLLM):
+      - model.language_model.*  : checkpoint 键 & sglang 内部模块命名
+      - language_model.model.*  : vLLM Qwen4ExpForConditionalGeneration 内部
+                                  模块命名 (language_model 子模块 + 其内部
+                                  hf_to_vllm_mapper 把 checkpoint 的
+                                  `model.language_model.` 前缀改回 `model.`,
+                                  外层再套一层 `language_model.`)
+      - mtp.*                   : MTP 层, 两边命名一致
+    compressed-tensors 用 re.match 前缀锚定匹配, 若只写 checkpoint 前缀
+    (model.language_model), vLLM 侧 layer_name 匹配失败 -> 走
+    UnquantizedFusedMoEMethod -> 只注册 w13_weight, 加载 .weight_packed
+    时抛出 AttributeError.
     """
     return {
         "config_groups": {
@@ -575,8 +589,9 @@ def build_compression_config(mode: str, group_size: int) -> dict:
                 "input_activations": _input_activations_arg(mode),
                 "output_activations": None,
                 "targets": [
-                    r"re:^(?:model\.language_model|mtp)\.layers\.\d+"
-                    r"\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+                    r"re:^(?:model\.language_model|language_model\.model|mtp)"
+                    r"\.layers\.\d+\.mlp\.experts\.\d+"
+                    r"\.(gate_proj|up_proj|down_proj)$",
                 ],
                 "weights": _weights_arg(group_size),
             }
