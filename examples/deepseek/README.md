@@ -30,3 +30,13 @@ python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
   --num-threads 32
 ```
 
+### DeepSeek-V4.1-Flash-Channel-INT4-w4a8
+
+```bash
+cd one-click-quant
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_mixed_int4_int8.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-Channel-INT4-w4a8 \
+  --mtp-experts int4 --int8-p2 --int8-p3
+```
+
