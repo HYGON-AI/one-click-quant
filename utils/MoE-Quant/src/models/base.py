@@ -126,7 +126,22 @@ class ModelAdapter:
         return model.model.layers
 
     def get_layer_prefix(self, block_idx: int) -> str:
+        """Checkpoint key prefix of one decoder block, e.g. ``model.layers.0.``."""
         return "model.layers.{}.".format(block_idx)
+
+    def get_module_prefix(self, block_idx: int) -> str:
+        """In-memory ``named_modules()`` prefix used to locate candidates.
+
+        Override when the live module tree differs from the checkpoint naming.
+        """
+        return self.get_layer_prefix(block_idx)
+
+    def to_checkpoint_name(self, module_name: str, block_idx: int) -> str:
+        """Normalise an in-memory module name back into checkpoint space."""
+        module_prefix = self.get_module_prefix(block_idx)
+        if module_name.startswith(module_prefix):
+            return f"{self.get_layer_prefix(block_idx)}{module_name[len(module_prefix):]}"
+        return module_name
 
     def logical_block_keys(
         self,
@@ -173,19 +188,54 @@ class ModelAdapter:
             result = result[0]
         return result, block_state
 
-    def get_quantization_ignore(self, quantize_only_experts: bool):
-        """Return ``(rule_name, compressed-tensors ignore list)``."""
-        ignored_modules = ["lm_head"]
+    def default_ignore_rules(self) -> List[str]:
+        """Structural ignore rules, independent of the quantization scope.
+
+        ``"re:<pattern>"`` is anchored with :func:`re.match`; a bare string must
+        equal the module name exactly.
+        """
+        return ["lm_head"]
+
+    def legacy_ignore_rules(self) -> List[str]:
+        """Rules reproducing the historical ``--quantize_only_experts`` scope."""
+        return [
+            r"re:.*self_attn.*",
+            r"re:.*shared_experts.*",
+            r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
+        ]
+
+    def resolve_ignore(
+        self,
+        ignore: Optional[Iterable[str]] = None,
+        quantize_only_experts: bool = False,
+    ) -> List[str]:
+        """Combine structural defaults, the legacy flag and user patterns."""
+        rules: List[str] = list(self.default_ignore_rules())
         if quantize_only_experts:
-            ignored_modules += [
-                r"re:.*self_attn.*",
-                r"re:.*shared_experts.*",
-                r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
-            ]
-            rule_name = "default_experts_only"
-        else:
-            rule_name = "default"
-        return rule_name, ignored_modules
+            for rule in self.legacy_ignore_rules():
+                if rule not in rules:
+                    rules.append(rule)
+        for item in ignore or []:
+            item = item.strip()
+            if item and item not in rules:
+                rules.append(item)
+        return rules
+
+    @staticmethod
+    def match_ignore(module_name: str, rules: Iterable[str]) -> bool:
+        """Mirror ``compressed_tensors.utils.match.match_name``."""
+        for rule in rules:
+            if rule.startswith("re:"):
+                if re.match(rule[len("re:"):], module_name) is not None:
+                    return True
+            elif rule == module_name:
+                return True
+        return False
+
+    def get_quantization_ignore(self, quantize_only_experts: bool):
+        """Legacy ``(rule_name, ignore list)`` entry point; delegates to resolve_ignore."""
+        rule_name = "default_experts_only" if quantize_only_experts else "default"
+        return rule_name, self.resolve_ignore(quantize_only_experts=quantize_only_experts)
 
     def set_quantization_config(self, config: Any, quantization_config: Dict[str, Any]) -> None:
         """Install output quantization metadata on the model config."""
@@ -200,14 +250,29 @@ class ModelAdapter:
         del weight_map
         return 0
 
+    # Side-files the packer does not generate (multimodal processor configs etc.).
+    _AUX_ARTIFACT_NAMES = (
+        "preprocessor_config.json",
+        "processor_config.json",
+        "video_preprocessor_config.json",
+        "image_processor_config.json",
+        "chat_template.jinja",
+        "merges.txt",
+        "vocab.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+    )
+
     def copy_artifacts(self, source_dir: str, output_dir: str) -> None:
-        """Copy model remote-code files needed to load the packed checkpoint."""
-        modeling_files = sorted(
-            name for name in os.listdir(source_dir)
-            if name.startswith("modeling_") and name.endswith(".py")
-        )
-        if modeling_files:
-            shutil.copy(os.path.join(source_dir, modeling_files[0]), output_dir)
+        """Copy remote-code ``*.py`` and :attr:`_AUX_ARTIFACT_NAMES` side-files."""
+        for name in sorted(os.listdir(source_dir)):
+            if name.endswith(".py") and os.path.isfile(os.path.join(source_dir, name)):
+                shutil.copy(os.path.join(source_dir, name), output_dir)
+
+        for name in self._AUX_ARTIFACT_NAMES:
+            source_path = os.path.join(source_dir, name)
+            if os.path.isfile(source_path):
+                shutil.copy(source_path, output_dir)
 
     def save_extra_weights(
         self,

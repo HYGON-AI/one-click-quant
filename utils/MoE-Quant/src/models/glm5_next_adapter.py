@@ -17,19 +17,11 @@ from .base import ModelAdapter
 class Glm5NextAdapter(ModelAdapter):
     """Adapter for GLM-5.3-Flash (``model_type="glm5_next"``).
 
-    Scope: routed experts only, symmetric INT4 or INT8 GPTQ; channel-wise or a
-    group_size that divides both routed-expert input dims (and is not 32, since
-    vLLM's compressed_tensors_moe_wna16 branches to MXFP4 at ``group_size==32``).
-
-    Non-expert paths kept in BF16 / their source dtypes:
-      - MLA projections (``self_attn.{q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj}``)
-      - DSA indexer (``self_attn.indexer.*``)
-      - KDA linear-attention (``self_attn.{q,k,v,b,g_a,g_b,forget_gate.f_a,forget_gate.f_b,o}_proj``,
-        ``self_attn.conv1d``, ``self_attn.forget_gate.{A_log,dt_bias}``)
-      - Hyper-Connection parameters (``attn_hc.*`` / ``ffn_hc.*``)
-      - Router (``mlp.gate.*``) and shared experts (``mlp.shared_experts.*``)
-      - Dense MLP layers (indices where ``mlp_layer_types[i] != "sparse"``)
-      - Norms, embedding, lm_head, vision tower, MTP layer 45.
+    Scope: symmetric INT4/INT8 GPTQ over every ``nn.Linear`` left after
+    ``default_ignore_rules()`` and ``--ignore``; ``--quantize_only_experts``
+    reproduces the historical routed-experts-only scope. ``group_size`` must
+    divide the layer input dim and never be 32 (vLLM branches to MXFP4 there).
+    Vision tower and MTP layer 45 are carried over as bf16 extra shards.
     """
 
     name = "glm5_next"
@@ -159,10 +151,11 @@ class Glm5NextAdapter(ModelAdapter):
             raise ValueError(
                 "GLM-5.3-Flash currently supports --bits 4 (W4A16) or --bits 8 (W8A16)."
             )
-        if not args.quantize_only_experts:
+        if not args.quantize_only_experts and not args.ignore:
             raise ValueError(
-                "GLM-5.3-Flash currently requires --quantize_only_experts; MLA, KDA, "
-                "indexer, hyper-connection, router, and shared experts stay in BF16."
+                "GLM-5.3-Flash requires either --quantize_only_experts (legacy: "
+                "routed experts only) or an explicit --ignore list; without one "
+                "every nn.Linear outside the structural defaults becomes a GPTQ target."
             )
         if not args.sym:
             raise ValueError(
@@ -184,9 +177,10 @@ class Glm5NextAdapter(ModelAdapter):
         self._validate_group_size(args)
 
     def validate_packing_args(self, args: Any) -> None:
-        if not args.quantize_only_experts:
+        if not args.quantize_only_experts and not args.ignore:
             raise ValueError(
-                "GLM-5.3-Flash currently requires an experts-only GPTQ result for packing."
+                "GLM-5.3-Flash packing needs either an experts-only GPTQ result or "
+                "the --ignore list recorded in metadata.pt by the quantization run."
             )
         if args.dtype != "bfloat16":
             raise ValueError("GLM-5.3-Flash currently requires --dtype bfloat16 for packing.")
@@ -445,44 +439,62 @@ class Glm5NextAdapter(ModelAdapter):
     # Quantization scope + coverage                                      #
     # ------------------------------------------------------------------ #
 
-    def get_quantization_ignore(self, quantize_only_experts: bool):
-        ignored_modules: List[str] = ["lm_head"]
-        if quantize_only_experts:
-            ignored_modules.extend(
-                [
-                    # embeddings and final norm
-                    r"re:.*embed_tokens(?:\..*)?$",
-                    r"re:.*\.norm(?:\..*)?$",
-                    r"re:.*(?:input|post_attention)_layernorm(?:\..*)?$",
-                    # MLA + KDA attention and DSA indexer (whole self_attn tree)
-                    r"re:.*\.self_attn(?:\..*)?$",
-                    # Hyper-Connection parameters (raw nn.Parameter, safe to be
-                    # explicit so any Linear-shaped subclass never accidentally
-                    # gets picked up).
-                    r"re:.*\.(attn_hc|ffn_hc)(?:\..*)?$",
-                    # Router (GateLinear in vLLM hard-codes quant_config=None).
-                    r"re:.*\.mlp\.gate(?:\..*)?$",
-                    # Shared experts (single non-routed MLP per sparse layer).
-                    r"re:.*\.mlp\.shared_experts(?:\..*)?$",
-                    # Dense MLP layers keep both the split and any fused form
-                    # (compressed_tensors expands `mlp.experts.0.*` to probe
-                    # the routed subtree, so this only affects dense blocks).
-                    r"re:.*\.mlp\.gate_up_proj(?:\..*)?$",
-                    r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
-                    # MTP layer 45 (next-n predict head, always BF16). The
-                    # `.*\.layers\.45` form covers both the multimodal path
-                    # (`model.language_model.layers.45.*`) and the text-only
-                    # path vLLM uses when building the MTP draft model, whose
-                    # prefix drops `language_model.`
-                    # (`model.layers.45.mtp_block.*`).
-                    r"re:.*\.layers\.45(?:\..*)?$",
-                    r"re:^model\.layers\.45(?:\..*)?$",
-                    # Vision tower (BF16 in the source FP8 checkpoint).
-                    r"re:.*visual(?:\..*)?$",
-                ]
-            )
-            return "glm5_next_experts_only", ignored_modules
-        return "default", ignored_modules
+    def default_ignore_rules(self) -> List[str]:
+        """Structural rules: weights that must never enter the quantized tree.
+
+        Patterns are prefix-agnostic because the same list is replayed into
+        ``quantization_config.ignore`` and matched against the runtime's own
+        module names; a ``^model\.language_model`` anchor would silently disable
+        every entry there.
+        """
+        return [
+            "lm_head",
+            # Embedding and norms are never nn.Linear GPTQ targets.
+            r"re:.*embed_tokens.*",
+            r"re:.*(?:input|post_attention)_layernorm(?:\..*)?$",
+            r"re:.*\.(?:q_a_layernorm|kv_a_layernorm|o_norm)(?:\..*)?$",
+            r"re:.*shared_head\.norm(?:\..*)?$",
+            r"re:.*\.(?:eh_proj|enorm|hnorm)$",
+            r"re:.*\.norm(?:\..*)?$",
+            # Vision tower and MTP layer 45 bypass GPTQ (bf16 extra shards).
+            r"re:.*visual(?:\..*)?$",
+            r"re:.*layers\.45(?:\..*)?$",
+            # KDA raw parameters and depthwise convolutions are not nn.Linear.
+            r"re:.*\.self_attn\.(?:A_log|dt_bias)$",
+            r"re:.*\.self_attn\.(?:q_conv1d|k_conv1d|v_conv1d)(?:\..*)?$",
+            # Hyper-Connection parameters (`attn_hc.fn` in the modeling code,
+            # `hc_attn_fn` in the checkpoint).
+            r"re:.*(?:hc_(?:attn|ffn)_(?:base|fn|scale)|(?:attn|ffn)_hc\.(?:base|fn|scale))$",
+            # Router: vLLM's GateLinear hard-codes quant_config=None.
+            r"re:.*\.mlp\.gate(?:\..*)?$",
+            # DSA indexer stays bf16, matching the FP8_DYNAMIC reference recipe.
+            r"re:.*\.self_attn\.indexer\..*$",
+        ]
+
+    def legacy_ignore_rules(self) -> List[str]:
+        return [
+            # embeddings, norms
+            r"re:.*embed_tokens(?:\..*)?$",
+            r"re:.*\.norm(?:\..*)?$",
+            r"re:.*(?:input|post_attention)_layernorm(?:\..*)?$",
+            # MLA + KDA attention and DSA indexer (whole self_attn tree)
+            r"re:.*\.self_attn(?:\..*)?$",
+            # Hyper-Connection parameters
+            r"re:.*\.(attn_hc|ffn_hc)(?:\..*)?$",
+            # Router
+            r"re:.*\.mlp\.gate(?:\..*)?$",
+            # Shared experts
+            r"re:.*\.mlp\.shared_experts(?:\..*)?$",
+            # Dense MLP layers, both the split and the fused spelling
+            r"re:.*\.mlp\.gate_up_proj(?:\..*)?$",
+            r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
+            # MTP layer 45 (always BF16); `.*\.layers\.45` also covers the
+            # text-only MTP draft model (`model.layers.45.mtp_block.*`).
+            r"re:.*\.layers\.45(?:\..*)?$",
+            r"re:^model\.layers\.45(?:\..*)?$",
+            # Vision tower (BF16 in the source FP8 checkpoint)
+            r"re:.*visual(?:\..*)?$",
+        ]
 
     def set_quantization_config(
         self, config: Any, quantization_config: Dict[str, Any]

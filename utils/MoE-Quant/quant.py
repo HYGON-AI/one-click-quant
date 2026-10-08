@@ -68,7 +68,17 @@ def parse_args():
         "--quantize_only_experts",
         default=False,
         action="store_true",
-        help="Whether to quantize only routed (non-shared) experts.",
+        help="Legacy scope switch: quantize only routed (non-shared) experts.",
+    )
+    parser.add_argument(
+        "--ignore",
+        type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
+        default=None,
+        metavar="PATTERN[,PATTERN...]",
+        help=(
+            "Comma-separated module names or 're:<regex>' patterns excluded from "
+            "quantization, appended to the adapter's structural defaults."
+        ),
     )
     # Save params
     parser.add_argument("--save_dir", type=str, default=None, help="where to save quantized model.")
@@ -243,8 +253,11 @@ def initialize_embeddings(args, runtime, model_context, calibration, checkpoint)
     ]
 
 
-def collect(block, prefix, model, args, adapter, inputs, position_ids, block_states, device, rank):
-    layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
+def collect(block, block_idx, model, args, adapter, ignore_rules, inputs, position_ids, block_states, device, rank):
+    # Candidates come from the live module tree; normalise their names at once so
+    # the ignore matcher, the output directories and the packer all agree.
+    module_prefix = adapter.get_module_prefix(block_idx)
+    layers = model_utils.select_layers(model, module_prefix, ".*", model_utils.LINEAR_LAYERS)
     handles = {}
     hooks = {}
 
@@ -254,8 +267,9 @@ def collect(block, prefix, model, args, adapter, inputs, position_ids, block_sta
 
         return _hook
 
-    for layer_name, layer in layers.items():
-        if args.quantize_only_experts and not adapter.is_routed_expert(layer_name):
+    for module_name, layer in layers.items():
+        layer_name = adapter.to_checkpoint_name(module_name, block_idx)
+        if adapter.match_ignore(layer_name, ignore_rules):
             continue
         tied_gptq_handle = None
         if args.tie_gptq_handles:
@@ -270,6 +284,8 @@ def collect(block, prefix, model, args, adapter, inputs, position_ids, block_sta
         handles[layer_name] = gptq.GPTQ(
             layer, args.group_size, args.sym, args.rel_damp, args.block_size,
             args.quantization_order, args.quantization_scale,
+            # Hessian all-reduce follows the structural predicate, never the
+            # ignore rules: only routed experts are rank-local under EP.
             is_distributed=not adapter.is_routed_expert(layer_name),
             tied_gptq_handle=tied_gptq_handle,
         )
@@ -315,10 +331,16 @@ def release(block, prefix, checkpoint, runtime):
     gc.collect()
 
 
-def save_quantization_metadata(args):
+def save_quantization_metadata(args, ignore_rules):
     if args.save_dir:
         torch.save(
-            {"bits": args.bits, "group_size": args.group_size, "quantize_only_experts": args.quantize_only_experts},
+            {
+                "bits": args.bits,
+                "group_size": args.group_size,
+                # Fully resolved; the packer replays this into quantization_config.ignore.
+                "ignore": list(ignore_rules),
+                "quantize_only_experts": args.quantize_only_experts,
+            },
             os.path.join(args.save_dir, "metadata.pt"),
         )
 
@@ -520,6 +542,13 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
     dtype = runtime.dtype
     adapter = model_context.adapter
     model = model_context.model
+    ignore_rules = adapter.resolve_ignore(args.ignore, args.quantize_only_experts)
+    dist_utils.print_on_main(
+        f"[INFO] quantization scope: {len(ignore_rules)} ignore rule(s), "
+        "every other Linear becomes a GPTQ target"
+    )
+    for rule in ignore_rules:
+        dist_utils.print_on_main(f"        ignore: {rule}")
     inputs = calibration.inputs
     position_ids = calibration.position_ids
     resume_block_idx = get_resume_block_idx(args.save_dir, adapter) if args.resume else 0
@@ -561,7 +590,8 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
         if block_idx >= resume_block_idx:
             # Collect GPTQ Hessian statistics for the current block.
             handles, hooks = collect(
-                block, prefix, model, args, adapter, inputs, position_ids, block_states, device, rank
+                block, block_idx, model, args, adapter, ignore_rules,
+                inputs, position_ids, block_states, device, rank
             )
             shared_handles = {k: v for k, v in handles.items() if not adapter.is_routed_expert(k)}
             expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
@@ -637,7 +667,7 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
         release(block, prefix, checkpoint, runtime)
 
-    save_quantization_metadata(args)
+    save_quantization_metadata(args, ignore_rules)
     cleanup_runtime()
 
 

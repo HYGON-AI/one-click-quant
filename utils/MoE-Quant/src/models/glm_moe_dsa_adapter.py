@@ -222,31 +222,23 @@ class GlmMoeDsaAdapter(ModelAdapter):
 
     # ---------- quantization scope ----------
 
-    def get_quantization_ignore(self, quantize_only_experts: bool):
-        ignored_modules: List[str] = ["lm_head"]
-        if quantize_only_experts:
-            ignored_modules.extend(
-                [
-                    "model.embed_tokens",
-                    r"re:.*\.self_attn(?:\..*)?$",
-                    r"re:.*\.mlp\.gate(?:\..*)?$",
-                    r"re:.*\.mlp\.shared_experts(?:\..*)?$",
-                    # sglang's DeepSeekV2MLP fuses dense-MLP gate+up into a single
-                    # MergedColumnParallelLinear named `gate_up_proj`. The on-disk
-                    # checkpoint stores them separately as `gate_proj`/`up_proj`,
-                    # but a serving engine that rebuilds the model from config will
-                    # create `mlp.gate_up_proj`. Cover both spellings so the dense
-                    # MLP layers are always excluded from the expert-only recipe.
-                    r"re:.*\.mlp\.gate_up_proj(?:\..*)?$",
-                    r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
-                    r"re:.*_layernorm(?:\..*)?$",
-                    r"re:.*\.(input|post_attention)_layernorm(?:\..*)?$",
-                    r"re:^model\.norm(?:\..*)?$",
-                    r"re:^model\.layers\.78(?:\..*)?$",
-                ]
-            )
-            return "glm_moe_dsa_experts_only", ignored_modules
-        return "default", ignored_modules
+    def default_ignore_rules(self) -> List[str]:
+        return ["lm_head"]
+
+    def legacy_ignore_rules(self) -> List[str]:
+        return [
+            "model.embed_tokens",
+            r"re:.*\.self_attn(?:\..*)?$",
+            r"re:.*\.mlp\.gate(?:\..*)?$",
+            r"re:.*\.mlp\.shared_experts(?:\..*)?$",
+            # sglang fuses dense-MLP gate+up into `gate_up_proj`; cover both spellings.
+            r"re:.*\.mlp\.gate_up_proj(?:\..*)?$",
+            r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
+            r"re:.*_layernorm(?:\..*)?$",
+            r"re:.*\.(input|post_attention)_layernorm(?:\..*)?$",
+            r"re:^model\.norm(?:\..*)?$",
+            r"re:^model\.layers\.78(?:\..*)?$",
+        ]
 
     # ---------- packing hooks ----------
 

@@ -305,28 +305,25 @@ class KimiK3Adapter(ModelAdapter):
 
         kimi_k3_utils.prepare_kimi_k3_model(model, config, dtype)
 
-    def get_quantization_ignore(self, quantize_only_experts: bool):
-        ignored_modules = [
+    def default_ignore_rules(self) -> List[str]:
+        return [
             r"re:(?:.*\.)?lm_head$",
             r"re:^vision_tower\..*",
             r"re:^mm_projector\..*",
         ]
-        if quantize_only_experts:
-            ignored_modules.extend(
-                [
-                    r"re:.*model\.embed_tokens(?:\..*)?$",
-                    r"re:.*\.self_attn\..*",
-                    r"re:.*\.gate(?:\..*)?$",
-                    r"re:.*\.shared_experts\..*",
-                    r"re:.*\.routed_expert_(down|up)_proj(?:\..*)?$",
-                    r"re:.*\.routed_expert_norm(?:\..*)?$",
-                    r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
-                    r"re:.*\.(self_attention|mlp)_res_(proj|norm)(?:\..*)?$",
-                    r"re:.*\.output_attn_res_(proj|norm)(?:\..*)?$",
-                ]
-            )
-            return "kimi_k3_experts_only", ignored_modules
-        return "default", ignored_modules
+
+    def legacy_ignore_rules(self) -> List[str]:
+        return [
+            r"re:.*model\.embed_tokens(?:\..*)?$",
+            r"re:.*\.self_attn\..*",
+            r"re:.*\.gate(?:\..*)?$",
+            r"re:.*\.shared_experts\..*",
+            r"re:.*\.routed_expert_(down|up)_proj(?:\..*)?$",
+            r"re:.*\.routed_expert_norm(?:\..*)?$",
+            r"re:.*\.mlp\.(gate|up|down)_proj(?:\..*)?$",
+            r"re:.*\.(self_attention|mlp)_res_(proj|norm)(?:\..*)?$",
+            r"re:.*\.output_attn_res_(proj|norm)(?:\..*)?$",
+        ]
 
     def set_quantization_config(self, config: Any, quantization_config: Dict[str, Any]) -> None:
         config.quantization_config = quantization_config

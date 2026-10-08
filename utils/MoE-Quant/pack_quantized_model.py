@@ -147,6 +147,19 @@ def _packing_format_for(args: argparse.Namespace) -> str:
     return "pack-quantized"
 
 
+def resolve_ignore_for_packing(args: argparse.Namespace, adapter: ModelAdapter) -> tuple[str, list[str]]:
+    """Return ``(rule_name, ignore list)`` for ``quantization_config``.
+
+    Replays the list recorded in ``metadata.pt`` so the packed ``ignore`` can
+    never disagree with the on-disk ``quantized_weight.pt`` set; metadata
+    without an ``ignore`` key falls back to the legacy flag-driven list.
+    """
+    recorded = getattr(args, "ignore", None)
+    if recorded:
+        return "recorded", list(recorded)
+    return adapter.get_quantization_ignore(args.quantize_only_experts)
+
+
 def prepare_quantization_config(
     args: argparse.Namespace,
     adapter: ModelAdapter,
@@ -164,7 +177,7 @@ def prepare_quantization_config(
             "type": "int",
         }
 
-    ignore_rule, ignored_modules = adapter.get_quantization_ignore(args.quantize_only_experts)
+    ignore_rule, ignored_modules = resolve_ignore_for_packing(args, adapter)
     weight_strategy = "channel" if args.group_size is None else "group"
     # Channel-wise is expressed on disk as `-1` (compressed-tensors canonical
     # sentinel). vLLM's CompressedTensorsWNA16MoEMethod reads the value
@@ -227,7 +240,8 @@ def main():
     metadata = torch.load(os.path.join(args.quantized_model_path, "metadata.pt"))
     args.bits = metadata["bits"]
     args.group_size = metadata["group_size"]
-    args.quantize_only_experts = metadata["quantize_only_experts"]
+    args.quantize_only_experts = metadata.get("quantize_only_experts", False)
+    args.ignore = metadata.get("ignore")
     # Currently we do not support asymmetric quantization
     args.sym = True
     adapter.validate_packing_args(args)
@@ -322,9 +336,17 @@ def main():
         current_output_shard_id += 1
         prefix = adapter.get_layer_prefix(block_idx)
         logical_block_keys = adapter.logical_block_keys(block, block_idx)
+        # Directory names are modelling-side, `logical_block_keys` are
+        # checkpoint-side; translate before matching (they differ on GLM-5.3-Flash).
+        quantized_output_names: dict[str, str] = {}
+        for layer_name in quantized_layer_names[block_idx]:
+            mapped = adapter.checkpoint_keys_for_model_key(layer_name, weight_map)
+            quantized_output_names[layer_name] = (
+                mapped[0] if len(mapped) == 1 else layer_name
+            )
         quantized_weight_keys = {
-            f"{layer_name}.weight"
-            for layer_name in quantized_layer_names[block_idx]
+            f"{output_name}.weight"
+            for output_name in quantized_output_names.values()
         }
         source_model_keys = logical_block_keys - quantized_weight_keys
 
@@ -363,9 +385,10 @@ def main():
                 args.group_size,
                 packing_format=packing_format,
             )
-            block_state_dict.pop(f"{layer_name}.weight", None)
-            block_state_dict.pop(f"{layer_name}.weight_scale_inv", None)
-            block_state_dict.update({f"{layer_name}.{k}": v for k, v in packed_weight_state_dict.items()})
+            output_name = quantized_output_names[layer_name]
+            block_state_dict.pop(f"{output_name}.weight", None)
+            block_state_dict.pop(f"{output_name}.weight_scale_inv", None)
+            block_state_dict.update({f"{output_name}.{k}": v for k, v in packed_weight_state_dict.items()})
 
         # Save block
         current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
