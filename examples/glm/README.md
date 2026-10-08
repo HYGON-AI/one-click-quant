@@ -54,6 +54,10 @@
   
 #  OR
   
-  python quantize_glm5_3_flash_int8_channel.py --input-dir /models/GLM-5.3-Flash --output-dir /models/GLM-5.3-Flash-CHANNEL-INT8-w8a8 --no-mla-to-bf16 --linear-attn-int8 --kda-int8-scope qkvo --indexer-int8
+  python quantize_glm5_3_flash_int8_channel.py --input-dir /models/GLM-5.3-Flash --output-dir /models/GLM-5.3-Flash-Channel-INT8-w8a8 --no-mla-to-bf16 --linear-attn-int8 --kda-int8-scope qkvo --indexer-int8
+
+### GLM-5.3-Flash-Channel-INT4-w4a8
+python3 quantize_glm5_3_flash_int4_channel.py --input-dir /models/GLM-5.3-Flash --output-dir /models/GLM-5.3-Flash-Channel-INT4-w4a8 --no-mla-to-bf16 --linear-attn-int8 --kda-int8-scope qkvo --indexer-int8
+
 ```
 
