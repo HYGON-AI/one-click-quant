@@ -1,11 +1,31 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+import os
 import re
+from glob import glob
 from typing import Optional, List
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
+
+
+def load_local_dataset(path: str):
+    """Load a calibration corpus from a local directory, never touching the Hub.
+
+    Accepts a ``save_to_disk`` directory, the raw layout of a Hub dataset repo
+    (``data/*.parquet``; sibling directories such as ``metadata/`` are ignored),
+    or any directory of parquet / json / jsonl shards.
+    """
+    if os.path.exists(os.path.join(path, "dataset_info.json")):
+        return load_from_disk(path)
+    data_dir = os.path.join(path, "data")
+    root = data_dir if os.path.isdir(data_dir) else path
+    for pattern, fmt in (("*.parquet", "parquet"), ("*.jsonl", "json"), ("*.json", "json")):
+        files = sorted(glob(os.path.join(root, "**", pattern), recursive=True))
+        if files:
+            return load_dataset(fmt, data_files=files, split="train")
+    raise ValueError(f"{path} holds no parquet/json/jsonl shard (looked under {root})")
 
 
 def split_thought_solution(text: str):
@@ -20,9 +40,13 @@ def prepare_open_thoughts(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
     num_calibration_samples: Optional[int] = None,
-    seed: int = 42
+    seed: int = 42,
+    raw_dataset=None
 ) -> List[torch.Tensor]:
-    train_dataset_raw = load_dataset("open-thoughts/OpenThoughts-114k", split="train")
+    train_dataset_raw = (
+        raw_dataset if raw_dataset is not None
+        else load_dataset("open-thoughts/OpenThoughts-114k", split="train")
+    )
     if num_calibration_samples:
         train_dataset_raw = train_dataset_raw.shuffle(seed=seed).select(range(num_calibration_samples))
     # Update chat template
@@ -64,9 +88,13 @@ def prepare_open_platypus(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
     num_calibration_samples: Optional[int] = None,
-    seed: int = 42
+    seed: int = 42,
+    raw_dataset=None
 ) -> List[torch.Tensor]:
-    train_dataset_raw = load_dataset("garage-bAInd/Open-Platypus", split="train")
+    train_dataset_raw = (
+        raw_dataset if raw_dataset is not None
+        else load_dataset("garage-bAInd/Open-Platypus", split="train")
+    )
     if num_calibration_samples:
         train_dataset_raw = train_dataset_raw.shuffle(seed=seed).select(range(num_calibration_samples))
     # Preprocess the data into the format the model is trained with.
@@ -120,6 +148,23 @@ def prepare_calibration_dataset(
     num_calibration_samples: Optional[int] = None,
     seed: int = 42
 ) -> List[torch.Tensor]:
+    # A directory is a locally stored corpus: route on its schema so the local
+    # copy goes through the same preprocessing as the matching Hub dataset.
+    if os.path.isdir(dataset_name):
+        raw_dataset = load_local_dataset(dataset_name)
+        columns = set(raw_dataset.column_names)
+        if {"system", "conversations"} <= columns:
+            return prepare_open_thoughts(
+                tokenizer, max_sequence_length, num_calibration_samples, seed, raw_dataset
+            )
+        if {"instruction", "output"} <= columns:
+            return prepare_open_platypus(
+                tokenizer, max_sequence_length, num_calibration_samples, seed, raw_dataset
+            )
+        raise ValueError(
+            f"{dataset_name} has columns {sorted(columns)}; expected an OpenThoughts "
+            "(system/conversations) or Open-Platypus (instruction/output) corpus"
+        )
     if dataset_name == "open-thoughts":
         return prepare_open_thoughts(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "open-platypus":
