@@ -44,6 +44,9 @@ Pack 布局对齐 compressed_tensors.compressors.pack_to_int32 (packed_dim=1):
       --output-dir /path/GLM-5.3-Flash-CHANNEL-INT4-w4a8 \\
       --no-mla-to-bf16 --linear-attn-int8 --kda-int8-scope qkvo --indexer-int8
 
+  可选 --mtp-int4: MTP 层 (layer 45, 由 config.json 推导) 的 routed experts 也量化为
+  INT4 W4A8 (默认关闭, 此时与上面命令产物完全一致).
+
 前置条件
 ========
   - torch >= 2.1 (含 torch.float8_e4m3fn dtype)
@@ -216,16 +219,38 @@ def is_indexer_int8_target(name: str) -> bool:
 # 命名前缀兼容 "model.layers." 与 "model.language_model.layers." (GLM 特有).
 # --------------------------------------------------------------------------- #
 
-_ROUTED_EXPERT_INT4_LAYERS = tuple(range(3, 45))   # [3, 4, ..., 44]
-_ROUTED_EXPERT_INT4_PATTERN = re.compile(
-    r"(?:^|\.)layers\.(?:" + "|".join(str(i) for i in _ROUTED_EXPERT_INT4_LAYERS)
-    + r")\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight$"
-)
+_BACKBONE_INT4_LAYERS = tuple(range(3, 45))   # [3, 4, ..., 44]
 
 
-def is_routed_expert_int4_target(name: str) -> bool:
-    """layer 3-44 的 routed experts (gate/up/down_proj) — 唯一走 INT4 的类别."""
-    return _ROUTED_EXPERT_INT4_PATTERN.search(name) is not None
+def get_mtp_layer_indices(input_dir: str) -> tuple[int, ...]:
+    """从源 config.json 推导 MTP 层号: num_hidden_layers + [0, num_nextn_predict_layers).
+
+    vLLM 运行时 MTP 模块注册为 model.layers.{num_hidden_layers + i}
+    (vllm/models/glm5next/nvidia/mtp.py), 与 checkpoint 的 layers.45 一致; 不硬编码 45.
+    """
+    with open(os.path.join(input_dir, "config.json"), "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config", cfg)
+    num_hidden = text_cfg["num_hidden_layers"]
+    num_mtp = text_cfg.get("num_nextn_predict_layers", 0)
+    return tuple(range(num_hidden, num_hidden + num_mtp))
+
+
+def build_int4_layers(mtp_int4: bool, mtp_layers: tuple[int, ...]) -> tuple[int, ...]:
+    """走 INT4 的 routed experts 层集合: 主干 3-44, mtp_int4 开启时追加 MTP 层."""
+    return _BACKBONE_INT4_LAYERS + (tuple(mtp_layers) if mtp_int4 else ())
+
+
+def make_routed_expert_int4_pattern(int4_layers: tuple[int, ...]) -> re.Pattern:
+    return re.compile(
+        r"(?:^|\.)layers\.(?:" + "|".join(str(i) for i in int4_layers)
+        + r")\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight$"
+    )
+
+
+def is_routed_expert_int4_target(name: str, pattern: re.Pattern) -> bool:
+    """int4_layers 内的 routed experts (gate/up/down_proj) — 唯一走 INT4 的类别."""
+    return pattern.search(name) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -347,13 +372,14 @@ def convert_one_file(
     linear_attn_int8: bool = False,
     kda_int8_scope: str = "full",
     indexer_int8: bool = False,
+    int4_layers: tuple[int, ...] = _BACKBONE_INT4_LAYERS,
 ) -> None:
     """转换单个 safetensors 分片 (混合精度 INT4/INT8/BF16).
 
     分支顺序 (先窄后宽, 命中即出):
       1. `.weight_scale_inv` -> 丢弃 (稍后按 INT4/INT8 重新写)
       2. MLA 4 投影反量化到 BF16 (若 mla_to_bf16=True)
-      3. 【INT4】routed experts layer 3-44 (FP8 -> INT4 W4A8 packed)
+      3. 【INT4】routed experts int4_layers (默认 layer 3-44, --mtp-int4 时含 MTP 层; FP8 -> INT4 W4A8 packed)
       4. 【INT8】FP8 blockwise -> INT8 channelwise (涵盖 layer 45 experts /
          shared_experts / dense MLP / MLA / 其它 FP8 源)
       5. 【INT8】Linear-attn BF16 -> INT8 (若 linear_attn_int8=True)
@@ -363,6 +389,7 @@ def convert_one_file(
     参数语义与 INT8 脚本 (quantize_glm5_3_flash_int8_channel-x.py) 一致.
     """
     device = torch.device(device) if not isinstance(device, torch.device) else device
+    int4_pattern = make_routed_expert_int4_pattern(int4_layers)
 
     state_dict: dict[str, torch.Tensor] = {}
     with safe_open(input_path, framework="pt", device="cpu") as f:
@@ -402,7 +429,7 @@ def convert_one_file(
 
         # 3. 【INT4】routed experts layer 3-44 (必须在 FP8→INT8 分支之前)
         if (
-            is_routed_expert_int4_target(name)
+            is_routed_expert_int4_target(name, int4_pattern)
             and is_fp8_blockwise_weight(name, tensor, state_dict)
         ):
             scale = state_dict[src_scale_name(name)]
@@ -528,10 +555,10 @@ def _resolve_devices(
 
 
 def _worker_convert_shard(
-    args: tuple[str, str, int, int, bool, bool, str, bool],
+    args: tuple[str, str, int, int, bool, bool, str, bool, tuple[int, ...]],
 ) -> dict[str, int]:
     (input_path, output_path, gpu_id, num_threads,
-     mla_to_bf16, linear_attn_int8, kda_int8_scope, indexer_int8) = args
+     mla_to_bf16, linear_attn_int8, kda_int8_scope, indexer_int8, int4_layers) = args
     torch.set_num_threads(max(1, num_threads))
     torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}")
@@ -545,6 +572,7 @@ def _worker_convert_shard(
         linear_attn_int8=linear_attn_int8,
         kda_int8_scope=kda_int8_scope,
         indexer_int8=indexer_int8,
+        int4_layers=int4_layers,
     )
     return stats
 
@@ -561,6 +589,7 @@ def convert_model(
     linear_attn_int8: bool = False,
     kda_int8_scope: str = "full",
     indexer_int8: bool = False,
+    int4_layers: tuple[int, ...] = _BACKBONE_INT4_LAYERS,
 ) -> tuple[dict[str, int], list[torch.device], int]:
     os.makedirs(output_dir, exist_ok=True)
     files = sorted(glob(os.path.join(input_dir, "*.safetensors")))
@@ -583,13 +612,14 @@ def convert_model(
                 linear_attn_int8=linear_attn_int8,
                 kda_int8_scope=kda_int8_scope,
                 indexer_int8=indexer_int8,
+                int4_layers=int4_layers,
             )
         return stats, devices, effective_workers
 
     import torch.multiprocessing as mp
     ctx = mp.get_context("spawn")
 
-    tasks: list[tuple[str, str, int, int, bool, bool, str, bool]] = []
+    tasks: list[tuple[str, str, int, int, bool, bool, str, bool, tuple[int, ...]]] = []
     for i, path in enumerate(files):
         gpu_id = devices[i % len(devices)].index
         fname = os.path.basename(path)
@@ -602,6 +632,7 @@ def convert_model(
             linear_attn_int8,
             kda_int8_scope,
             indexer_int8,
+            int4_layers,
         ))
 
     desc = f"Converting on {len(devices)} GPU(s) ({effective_workers} workers)"
@@ -719,12 +750,14 @@ def build_ignore_list(
     return ignore
 
 
-# routed experts (layer 3-44) 的 targets 正则. 用非贪婪匹配以兼容
+# routed experts 的 targets 正则. 用非贪婪匹配以兼容
 # "model.layers." / "model.language_model.layers." 两种前缀.
-_ROUTED_EXPERT_INT4_TARGET_REGEX = (
-    r"re:.*\.layers\.(?:" + "|".join(str(i) for i in _ROUTED_EXPERT_INT4_LAYERS)
-    + r")\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
-)
+# 层号用数字锚定运行时模块名 (layers.N), 不能用 checkpoint 的 mtp. 前缀.
+def make_routed_expert_int4_target_regex(int4_layers: tuple[int, ...]) -> str:
+    return (
+        r"re:.*\.layers\.(?:" + "|".join(str(i) for i in int4_layers)
+        + r")\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
+    )
 
 
 def _build_int4_activations() -> dict:
@@ -741,9 +774,10 @@ def build_compression_config(
     linear_attn_int8: bool = False,
     kda_int8_scope: str = "full",
     indexer_int8: bool = False,
+    int4_layers: tuple[int, ...] = _BACKBONE_INT4_LAYERS,
 ) -> dict:
     """生成 compressed-tensors 双 config_groups 配置:
-      group_int4: routed experts layer 3-44 (W4A8, pack-quantized, channel)
+      group_int4: routed experts int4_layers (W4A8, pack-quantized, channel)
       group_int8: Linear 兜底 (W8A8, int-quantized, channel)
     vLLM 侧 find_matched_target 会按最具体正则为每层分派到对应 group.
     """
@@ -769,7 +803,7 @@ def build_compression_config(
     }
 
     group_int4 = {
-        "targets": [_ROUTED_EXPERT_INT4_TARGET_REGEX],
+        "targets": [make_routed_expert_int4_target_regex(int4_layers)],
         "input_activations": int8_input_activations,
         "output_activations": None,
         "format": "pack-quantized",  # per-group 覆盖: W4 必须 pack-quantized
@@ -859,6 +893,7 @@ def copy_metadata(
     linear_attn_int8: bool = False,
     kda_int8_scope: str = "full",
     indexer_int8: bool = False,
+    int4_layers: tuple[int, ...] = _BACKBONE_INT4_LAYERS,
 ) -> None:
     """复制配置文件, 更新 quantization_config, 并重建 index."""
     for fname in [
@@ -906,6 +941,7 @@ def copy_metadata(
         linear_attn_int8=linear_attn_int8,
         kda_int8_scope=kda_int8_scope,
         indexer_int8=indexer_int8,
+        int4_layers=int4_layers,
     )
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -918,6 +954,7 @@ def write_summary(
     args,
     devices: list[torch.device],
     workers: int,
+    int4_layers: tuple[int, ...] = _BACKBONE_INT4_LAYERS,
 ) -> None:
     if args.linear_attn_int8:
         if args.kda_int8_scope == "qkvo":
@@ -949,12 +986,18 @@ def write_summary(
         },
         "layout": {
             "int4_targets": (
-                "routed experts layer 3-44 (mlp.experts.*.gate/up/down_proj): "
+                (
+                    f"routed experts layer {_BACKBONE_INT4_LAYERS[0]}-{_BACKBONE_INT4_LAYERS[-1]}"
+                    + (f" + MTP layer {sorted(set(int4_layers) - set(_BACKBONE_INT4_LAYERS))}"
+                       if args.mtp_int4 else "")
+                )
+                + " (mlp.experts.*.gate/up/down_proj): "
                 "INT4 W4A8 channelwise (pack-quantized, int32 packed, per-out-channel bf16 scale)"
             ),
             "int8_targets": (
-                "routed experts layer 45 MTP (moe_int8_layers=[45] alignment) / "
-                "shared_experts / dense MLP (layer 0-2)"
+                ("" if args.mtp_int4 else
+                 "routed experts layer 45 MTP (moe_int8_layers=[45] alignment) / ")
+                + "shared_experts / dense MLP (layer 0-2)"
                 + ("" if args.mla_to_bf16 else
                    " / MLA q_a/q_b/kv_a_proj_with_mqa/o_proj")
                 + linear_attn_desc
@@ -977,6 +1020,8 @@ def write_summary(
             "linear_attn_int8": args.linear_attn_int8,
             "kda_int8_scope": args.kda_int8_scope,
             "indexer_int8": args.indexer_int8,
+            "mtp_int4": args.mtp_int4,
+            "int4_layers": list(int4_layers),
             "used_compressed_tensors_pack": _HAVE_COMPRESSED_TENSORS_PACK,
         },
         "stats": stats,
@@ -1088,6 +1133,18 @@ def main() -> None:
             "to INT8 channelwise (12 layers). Default: False."
         ),
     )
+    parser.add_argument(
+        "--mtp-int4",
+        action=BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also quantize the MTP layer's routed experts (gate/up/down_proj) to "
+            "INT4 W4A8 instead of INT8 W8A8. MTP layer ids are derived from the "
+            "source config.json (num_hidden_layers + num_nextn_predict_layers; "
+            "layer 45 for GLM-5.3-Flash). MTP shared_experts / attention / indexer "
+            "stay INT8; eh_proj/enorm/hnorm/shared_head stay BF16. Default: False."
+        ),
+    )
     args = parser.parse_args()
 
     if os.path.abspath(args.input_dir) == os.path.abspath(args.output_dir):
@@ -1110,10 +1167,19 @@ def main() -> None:
 
     torch.set_num_threads(args.num_threads)
 
+    mtp_layers = get_mtp_layer_indices(args.input_dir)
+    if args.mtp_int4 and not mtp_layers:
+        raise ValueError(
+            "--mtp-int4 requested but source config.json has num_nextn_predict_layers=0"
+        )
+    int4_layers = build_int4_layers(args.mtp_int4, mtp_layers)
+
     print(f"Converting {args.input_dir} to mixed INT4/INT8 W4A8+W8A8 format...")
     print(f"  output_dir            : {args.output_dir}")
-    print(f"  routed experts (INT4) : layer {_ROUTED_EXPERT_INT4_LAYERS[0]}-"
-          f"{_ROUTED_EXPERT_INT4_LAYERS[-1]} mlp.experts.*.{{gate,up,down}}_proj")
+    print(f"  routed experts (INT4) : layers {int4_layers[0]}-{_BACKBONE_INT4_LAYERS[-1]}"
+          + (f" + MTP {list(mtp_layers)}" if args.mtp_int4 else "")
+          + " mlp.experts.*.{gate,up,down}_proj")
+    print(f"  mtp_int4              : {args.mtp_int4} (mtp_layers={list(mtp_layers)})")
     print(f"  mla_to_bf16           : {args.mla_to_bf16}")
     print(f"  linear_attn_int8      : {args.linear_attn_int8}")
     print(f"  kda_int8_scope        : {args.kda_int8_scope}")
@@ -1138,6 +1204,7 @@ def main() -> None:
         linear_attn_int8=args.linear_attn_int8,
         kda_int8_scope=args.kda_int8_scope,
         indexer_int8=args.indexer_int8,
+        int4_layers=int4_layers,
     )
     copy_metadata(
         args.input_dir,
@@ -1147,8 +1214,23 @@ def main() -> None:
         linear_attn_int8=args.linear_attn_int8,
         kda_int8_scope=args.kda_int8_scope,
         indexer_int8=args.indexer_int8,
+        int4_layers=int4_layers,
     )
-    write_summary(args.output_dir, stats, args, devices, workers)
+    write_summary(args.output_dir, stats, args, devices, workers, int4_layers)
+
+    # 自检: config 声明的 INT4 层必须与实际写出的 INT4 张量数一致 (防 config/权重错配).
+    # --limit-files 只转换部分分片, 跳过.
+    if args.mtp_int4 and args.limit_files is None:
+        with open(os.path.join(args.input_dir, "config.json"), "r", encoding="utf-8") as f:
+            _cfg = json.load(f)
+        n_experts = _cfg.get("text_config", _cfg)["n_routed_experts"]
+        expected = n_experts * 3 * len(int4_layers)
+        if stats["experts_int4_packed"] != expected:
+            raise RuntimeError(
+                f"experts_int4_packed={stats['experts_int4_packed']} != expected {expected} "
+                f"({n_experts} experts x 3 proj x {len(int4_layers)} layers); "
+                f"config.json 声明的 INT4 层与实际量化张量不一致"
+            )
 
     print()
     print(json.dumps(stats, ensure_ascii=False, sort_keys=True, indent=2))
