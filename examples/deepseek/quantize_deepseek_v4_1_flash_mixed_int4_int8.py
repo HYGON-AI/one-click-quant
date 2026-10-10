@@ -64,7 +64,7 @@ DeepSeek-V4.1-Flash FP4/FP8 block -> 混合精度 INT4/INT8 转换脚本
   layers.*.attn.indexer.wq_b           原 FP8 -> INT8
   layers.*.engram.wkv                  原 FP8 -> INT8
 
-  不含 layers.*.attn.wo_a: 它恒为 BF16 (见下)。
+  不含 layers.*.attn.wo_a: 默认为 BF16, 需单独的 --int8-wo-a 开关 (见下)。
 
   依据: 原始 checkpoint 都是 8bit。
   wo_a 为何排除:
@@ -81,6 +81,25 @@ DeepSeek-V4.1-Flash FP4/FP8 block -> 混合精度 INT4/INT8 转换脚本
     - wo_b 的输入可能是 `QuantizedActivation` / GEMM-RS 融合路径;
     - indexer.wq_b 影响 DSA sparse top-k 的离散选择, 需 top-k 一致性验证;
     - engram.wkv 输出进入 Engram 专用归一化门控 + Triton kernel。
+
+【可选 — --int8-wo-a 开启，默认关闭，独立于 p2/p3】
+  layers.*.attn.wo_a                   原 FP8 -> INT8
+  mtp.*.attn.wo_a                      原 FP8 -> INT8  (同档, 理由同 p2 的 MTP 说明)
+
+  !! 当前 vLLM 无法运行该选项的产物 !!
+    wo_a 带 `is_bmm=True`, o_proj 走手写路径 deep_gemm_fp8_o_proj
+    (vllm/models/deepseek_v4/nvidia/ops/o_proj.py:49-86), 只有 fp8 / bf16 两个
+    分支。INT8 weight 经 CutlassInt8ScaledMMLinearKernel 加载后处理会被转置成
+    (K, N) (scaled_mm/cutlass.py:50-55), 随后 `.view(n_groups, o_lora_rank, -1)`
+    失败; 即使不失败, bf16 分支也不会乘 INT8 weight_scale。
+    本开关只负责产出 "INT8 weight + fp32 per-out-channel weight_scale" 与对应
+    config, 供已自行为 wo_a 补了 INT8 分组 BMM kernel 的引擎使用
+    (需: o_proj 增加 INT8 分支 + 保持 weight 为 (N, K) 或按转置布局取用 +
+     激活改为 per-token INT8)。未打补丁的 vLLM 上启用会在 profile_run 首次前向崩溃。
+  数值: wo_a 形状为 (n_groups*o_lora_rank, n_heads*head_dim/n_groups), 每个输出行
+    只属于一个 group, per-output-channel 量化与分组 BMM 兼容。
+  config: 单独成组 group_int8_wo_a, 并从 ignore 中移除 `attn.wo_a`。
+    wo_a 不在 packed_modules_mapping 里, 不会触发 partial-ignore。
 
 【MTP (DSpark draft) routed experts — --mtp-experts，默认 int4】
   mtp.*.ffn.experts.*.w[123]           原 **MXFP4** (与主干 routed experts 同格式,
@@ -135,6 +154,10 @@ DeepSeek-V4.1-Flash FP4/FP8 block -> 混合精度 INT4/INT8 转换脚本
   # 加优先级三 (MLA 输出投影 wo_b + indexer.wq_b + engram.wkv 也 INT8)
   python quantize_deepseek_v4_1_flash_mixed_int4_int8.py \\
       --int8-p2 --int8-p3 --input-dir ... --output-dir ...
+
+  # 另外把 wo_a 也量化为 INT8 (需引擎侧自带 wo_a INT8 BMM kernel, 见上)
+  python quantize_deepseek_v4_1_flash_mixed_int4_int8.py \\
+      --int8-p2 --int8-p3 --int8-wo-a --input-dir ... --output-dir ...
 
   # 显式覆盖 engram.wkv 策略 (默认 bf16; --int8-p3 时自动变 int8)
   python quantize_deepseek_v4_1_flash_mixed_int4_int8.py \\
@@ -264,6 +287,9 @@ P2_ATTN_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.(?:wq_a|wkv|wq_b)\.weight$
 # wo_a 不在此列: 它带 is_bmm=True, vLLM 的 deep_gemm_fp8_o_proj 直接读
 # wo_a.weight 做 view/bmm, 只有 fp8 / bf16 分支, 没有 INT8。详见 build_ignore_list。
 P3_ATTN_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.wo_b\.weight$")
+# 可选 (--int8-wo-a): MLA 输出侧的分组低秩 down 投影 wo_a。
+# MTP 一并处理, 理由同 P2_ATTN_RE: 运行时 target `layers.\d+` 同样命中草稿层 40/41/42。
+WO_A_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.wo_a\.weight$")
 # 优先级三: DSA indexer 的 query 投影
 P3_INDEXER_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.indexer\.wq_b\.weight$")
 
@@ -302,7 +328,8 @@ class ConvOptions:
     group_size: int = -1          # INT4 沿输入维 K 的分组; -1 = per-channel
     mode: str = "w4a8"            # INT4 组的激活声明; w4a8(默认) 或 w4a16
     int8_p2: bool = False         # 优先级二: attn.wq_a / wkv / wq_b -> INT8
-    int8_p3: bool = False         # 优先级三: attn.wo_a / wo_b / indexer.wq_b / engram.wkv -> INT8
+    int8_p3: bool = False         # 优先级三: attn.wo_b / indexer.wq_b / engram.wkv -> INT8
+    int8_wo_a: bool = False       # 可选: attn.wo_a -> INT8 (vLLM 现有 o_proj 路径不支持)
     engram_wkv_mode: str = "bf16"  # bf16 | blockwise | int8
     mtp_experts: str = "int4"     # MTP routed experts: bf16 | int4 | int8
 
@@ -526,6 +553,11 @@ def is_p3_attn_weight(name: str) -> bool:
     return P3_ATTN_RE.match(name) is not None
 
 
+def is_wo_a_weight(name: str) -> bool:
+    """可选 (--int8-wo-a): {layers,mtp}.{L}.attn.wo_a.weight"""
+    return WO_A_RE.match(name) is not None
+
+
 def is_p3_indexer_weight(name: str) -> bool:
     """优先级三: layers.{L}.attn.indexer.wq_b.weight (不含 mtp.*)"""
     return P3_INDEXER_RE.match(name) is not None
@@ -540,6 +572,8 @@ def is_int8_target(name: str, opts: ConvOptions) -> bool:
     if opts.int8_p3 and is_p3_attn_weight(name):
         return True
     if opts.int8_p3 and is_p3_indexer_weight(name):
+        return True
+    if opts.int8_wo_a and is_wo_a_weight(name):
         return True
     return False
 
@@ -583,7 +617,8 @@ def convert_one_file(
       4.  MTP experts                  -> BF16
       5.  shared experts (主干)         -> INT8            【优先级一, 始终】
       6.  attn.wq_a / wkv / wq_b       -> INT8 或落回 BF16 【优先级二, 可选】
-      7.  attn.wo_a / wo_b             -> INT8 或落回 BF16 【优先级三, 可选】
+      7.  attn.wo_b                    -> INT8 或落回 BF16 【优先级三, 可选】
+          attn.wo_a                    -> INT8 或落回 BF16 【--int8-wo-a, 可选】
       8.  attn.indexer.wq_b            -> INT8 或落回 BF16 【优先级三, 可选】
       9.  其它 FP8 blockwise           -> BF16
       10. 其余 (BF16/FP32/非 2D)        -> 原样透传
@@ -725,6 +760,8 @@ def convert_one_file(
                 stats["attn_int8_p3"] += 1
             elif is_p3_indexer_weight(name):
                 stats["indexer_wqb_int8"] += 1
+            elif is_wo_a_weight(name):
+                stats["attn_wo_a_int8"] += 1
             continue
 
         # 9. 其它 FP8 blockwise (MLA 未启用部分 / compressor / indexer.wk /
@@ -756,6 +793,7 @@ _STATS_KEYS = (
     "attn_int8_p2",
     "attn_int8_p3",
     "indexer_wqb_int8",
+    "attn_wo_a_int8",
     "engram_wkv_int8",
     "mtp_expert_int4",
     "mtp_expert_int8",
@@ -1106,7 +1144,7 @@ def build_ignore_list(opts: ConvOptions) -> list[str]:
             r"re:.*attn\.wq_b$",
             r"re:.*self_attn\.wq_b$",
         ])
-    # wo_a 恒为 BF16, 不受 --int8-p3 影响。
+    # wo_a 默认 BF16, 不受 --int8-p3 影响, 仅由 --int8-wo-a 单独放行。
     # 它带 is_bmm=True, vLLM 的 deep_gemm_fp8_o_proj 直接读 wo_a.weight 做
     # .view(n_groups, o_lora_rank, -1) + torch.bmm, 只有 fp8 / bf16 两个分支,
     # INT8 会掉进 bf16 分支并在 view 处抛
@@ -1114,9 +1152,11 @@ def build_ignore_list(opts: ConvOptions) -> list[str]:
     # 这条手写路径绕过了 quant_method.apply(), 所以 linear 侧的
     # CutlassInt8ScaledMMLinearKernel 救不了它。同一缺口在 ROCm
     # (rocm_aiter_mla_sparse) / CPU (cpu_sparse) / XPU (xpu_sparse) 的
-    # o_proj 路径同样存在, 因此在量化侧剔除是跨平台的。
+    # o_proj 路径同样存在, 因此默认在量化侧剔除是跨平台的。
+    # 开启 --int8-wo-a 即表示引擎侧已自备 INT8 wo_a kernel, 此时不再 ignore。
     # wo_a 不在 packed_modules_mapping 里, 单独 ignore 不会触发 partial-ignore。
-    ignore.append(r"re:.*attn\.wo_a$")
+    if not opts.int8_wo_a:
+        ignore.append(r"re:.*attn\.wo_a$")
     if not opts.int8_p3:
         # 未启用优先级三: MLA 输出投影 + indexer.wq_b 全部 ignore。
         ignore.extend([
@@ -1197,7 +1237,8 @@ def build_compression_config(opts: ConvOptions) -> dict:
         }
 
     # ---- 优先级三 (可选): MLA 输出投影 wo_b + indexer.wq_b + engram.wkv ----
-    # wo_a 不在此组: vLLM 的 o_proj 手写路径只支持 fp8/bf16, 见 build_ignore_list。
+    # wo_a 不在此组: vLLM 的 o_proj 手写路径只支持 fp8/bf16, 见 build_ignore_list;
+    # 如需量化请用 --int8-wo-a (下方 group_int8_wo_a)。
     if opts.int8_p3:
         groups["group_int8_attn_output"] = {
             "targets": [
@@ -1216,6 +1257,14 @@ def build_compression_config(opts: ConvOptions) -> dict:
                 "targets": [r"re:.*layers\.\d+\.engram\.wkv$"],
                 **int8_group_kwargs,
             }
+
+    # ---- 可选: wo_a (分组低秩 O 投影) ----
+    # 独立于 p3, 单独成组便于从 config 一眼看出; 需引擎侧自备 INT8 BMM kernel。
+    if opts.int8_wo_a:
+        groups["group_int8_wo_a"] = {
+            "targets": [r"re:.*layers\.\d+\.(?:attn|self_attn)\.wo_a$"],
+            **int8_group_kwargs,
+        }
 
     return {
         "config_groups": groups,
@@ -1349,6 +1398,8 @@ def write_summary(
         int8_targets.append("MTP experts mtp.*.ffn.experts.*.w[123]")
     if opts.int8_p2:
         int8_targets.append("MLA 输入投影 (attn.wq_a / attn.wkv / attn.wq_b)")
+    if opts.int8_wo_a:
+        int8_targets.append("MLA 分组 O 投影 (attn.wo_a, 需引擎自带 INT8 BMM kernel)")
     if opts.int8_p3:
         int8_targets.append("MLA 输出投影 (attn.wo_b)")
         int8_targets.append("DSA indexer (attn.indexer.wq_b)")
@@ -1361,6 +1412,7 @@ def write_summary(
         "priority_1_always_on": True,
         "priority_2_enabled": opts.int8_p2,
         "priority_3_enabled": opts.int8_p3,
+        "int8_wo_a_enabled": opts.int8_wo_a,
         "mode": opts.mode,
         "group_size": opts.group_size,
         "engram_wkv_mode": opts.engram_wkv_mode,
@@ -1391,6 +1443,7 @@ def write_summary(
                 "markov_head / confidence_head / hc_* / engram"
             ),
             "kept_bf16": (
+                "attn.wo_a (除非 --int8-wo-a) / "
                 "compressor (wkv/wgate/norm) / indexer.wk / indexer.weights_proj / "
                 "all RMSNorm / MoE router gate / hc_* / attn_sink / "
                 "engram.q_weight / engram.k_weight / vision / aligner / embed / head"
@@ -1624,6 +1677,7 @@ def _self_check_draft_runtime_names(opts: ConvOptions, model_dir: str) -> None:
         ("attn.wq_b", opts.int8_p2, "p2"),
         ("attn.wo_b", opts.int8_p3, "p3"),
         ("attn.indexer.wq_b", opts.int8_p3, "p3"),
+        ("attn.wo_a", opts.int8_wo_a, "int8-wo-a"),
     ]
     for layer in draft_layers:
         for suffix, enabled, flagname in attn_cases:
@@ -1640,12 +1694,8 @@ def _self_check_draft_runtime_names(opts: ConvOptions, model_dir: str) -> None:
                     f"{tgt!r} 命中并按 INT8 建参数, 而脚本写的是 BF16"
                 )
 
-        # wo_a 恒 BF16: deep_gemm_fp8_o_proj 没有 INT8 分支, 任何时候都必须 ignore
-        wo_a = f"model.layers.{layer}.attn.wo_a"
-        assert _ignored(wo_a), (
-            f"{wo_a} 未被 ignore -> p3 开启时会被 wo_b 那一组顺带命中并按 INT8 建参数, "
-            f"但 deep_gemm_fp8_o_proj 只支持 fp8/bf16"
-        )
+        # wo_a 的放行与否已由上面的 attn_cases (--int8-wo-a) 覆盖;
+        # 关闭时必须 ignore (deep_gemm_fp8_o_proj 没有 INT8 分支), 开启时必须被 group_int8_wo_a 命中。
 
         # shared_experts 的 int8 组是无条件的, 草稿层必须同样放行
         shared = f"model.layers.{layer}.ffn.shared_experts.gate_up_proj"
@@ -1658,6 +1708,7 @@ def _self_check_draft_runtime_names(opts: ConvOptions, model_dir: str) -> None:
     for layer in draft_layers:
         for suffix, enabled in [
             ("attn.wq_b.weight", opts.int8_p2),
+            ("attn.wo_a.weight", opts.int8_wo_a),
             ("ffn.shared_experts.w1.weight", True),
         ]:
             ckpt = f"mtp.0.{suffix}"
@@ -1739,6 +1790,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--int8-wo-a",
+        action="store_true",
+        default=False,
+        help=(
+            "Quantize layers.*.attn.wo_a (and the MTP draft's wo_a) from FP8 to "
+            "INT8 channelwise, as its own config group. Independent of "
+            "--int8-p2/--int8-p3. Default: off (wo_a stays BF16). WARNING: stock "
+            "vLLM cannot run the result: wo_a is_bmm=True and its o_proj path "
+            "(deep_gemm_fp8_o_proj) only implements fp8/bf16 branches, so an "
+            "INT8 wo_a fails at the first forward (profile_run). Enable only if "
+            "your engine provides a grouped INT8 BMM kernel for wo_a."
+        ),
+    )
+    parser.add_argument(
         "--engram-wkv-mode",
         type=str,
         choices=list(ENGRAM_WKV_MODES),
@@ -1813,6 +1878,7 @@ def main() -> None:
         mode=args.mode,
         int8_p2=args.int8_p2,
         int8_p3=args.int8_p3,
+        int8_wo_a=args.int8_wo_a,
         engram_wkv_mode=engram_wkv_mode,
         mtp_experts=args.mtp_experts,
     )
@@ -1833,7 +1899,11 @@ def main() -> None:
     )
     print(f"  priority 1        : ON  (routed experts INT4 + shared experts INT8)")
     print(f"  priority 2        : {'ON ' if opts.int8_p2 else 'off'} (attn.wq_a/wkv/wq_b -> INT8)")
-    print(f"  priority 3        : {'ON ' if opts.int8_p3 else 'off'} (attn.wo_b, indexer.wq_b -> INT8; attn.wo_a 恒 BF16)")
+    print(f"  priority 3        : {'ON ' if opts.int8_p3 else 'off'} (attn.wo_b, indexer.wq_b -> INT8)")
+    print(f"  int8 wo_a         : {'ON ' if opts.int8_wo_a else 'off'} (attn.wo_a -> INT8; off = BF16)")
+    if opts.int8_wo_a:
+        print("  !! WARNING: --int8-wo-a 产物需要引擎自带 wo_a INT8 BMM kernel, "
+              "未打补丁的 vLLM 会在首次前向崩溃 (见脚本顶部说明)")
     print(f"  engram_wkv_mode   : {opts.engram_wkv_mode}")
     print(
         f"  mtp_experts       : {opts.mtp_experts}"
