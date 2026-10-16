@@ -80,4 +80,12 @@
     --no-mla-to-bf16 --linear-attn-int8 \
     --kda-int8-scope qkvo --indexer-int8 --mtp-int4
 ```
+### GLM-5.3-Channel-INT4-w4a8
+```
+cd /quant_models/one-click-quant/examples/glm
+python quantize_glm5_3_int4_channel.py \
+  --input-dir  /llm-models/GLM-5.3 \
+  --output-dir /quant_models/GLM-5.3-CHANNEL-INT4-w4a8
+```
+
 
