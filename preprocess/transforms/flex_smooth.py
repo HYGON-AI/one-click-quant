@@ -12,6 +12,7 @@ from preprocess.io import WeightStore
 from preprocess.transforms.absorb import (
     absorb_gemma_tied_hc,
     absorb_norm_linear,
+    as_act_matrix,
     compute_weight_channel_max,
     expand_module_globs,
     make_scales_from_alpha_beta,
@@ -36,9 +37,7 @@ def search_alpha_beta(
 ) -> Tuple[float, float, float]:
     """Grid-search alpha with beta=1-alpha, then refine beta. Returns (alpha, beta, mse)."""
     w = weight.float()
-    a = act.float()
-    if a.dim() > 2:
-        a = a.reshape(-1, a.shape[-1])
+    a = as_act_matrix(act)
     if a.shape[0] > 2048:
         idx = torch.randperm(a.shape[0])[:2048]
         a = a[idx]

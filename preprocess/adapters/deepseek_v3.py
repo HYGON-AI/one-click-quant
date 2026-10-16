@@ -299,6 +299,8 @@ class DeepSeekV3Adapter(ModelAdapter):
 
         new_wm: Dict[str, str] = {}
         total_unpacked = 0
+        missing_scales: List[str] = []
+        raw_fp8_copied: List[str] = []
         shards = sorted(by_shard.keys())
         logger.info(
             "deepseek_v3 streaming FP8 unpack: {} shards {} -> {} (group={}, batch={}, resume={})",
@@ -420,7 +422,18 @@ class DeepSeekV3Adapter(ModelAdapter):
                             continue
                     if k not in local_keys:
                         continue
-                    batch[k] = f.get_tensor(k)
+                    t = f.get_tensor(k)
+                    # FP8 weight without a registered scale must not be written.
+                    # Writing it would let a later resume treat the shard as complete
+                    # and stamp deepseek_fp8_unpacked=True.
+                    if k.endswith(".weight") and t.dtype in _FP8_DTYPES:
+                        raw_fp8_copied.append(k)
+                        raise RuntimeError(
+                            "deepseek_v3 unpack: FP8 weight "
+                            f"{k} has no weight_scale_inv in the index; "
+                            "refusing to copy raw FP8 or mark unpack complete."
+                        )
+                    batch[k] = t
                     if len(batch) >= 256:
                         flush_batch()
 
@@ -430,9 +443,11 @@ class DeepSeekV3Adapter(ModelAdapter):
                     if w_key not in local_keys:
                         continue
                     if s_key not in weight_map:
-                        logger.warning("deepseek_v3 unpack: missing scale for {}; copy raw", w_key)
-                        batch[w_key] = f.get_tensor(w_key)
-                        continue
+                        missing_scales.append(mod)
+                        raise RuntimeError(
+                            "deepseek_v3 unpack: missing weight_scale_inv for "
+                            f"{w_key}; refusing to copy raw FP8 or mark unpack complete."
+                        )
                     w = f.get_tensor(w_key)
                     scale_shard = weight_map[s_key]
                     if scale_shard == shard and s_key in local_keys:
@@ -458,6 +473,15 @@ class DeepSeekV3Adapter(ModelAdapter):
                 len(shards),
                 shard,
                 total_unpacked,
+            )
+
+        if missing_scales or raw_fp8_copied:
+            examples = (missing_scales[:5] + raw_fp8_copied[:5])[:8]
+            raise RuntimeError(
+                "deepseek_v3 FP8 unpack incomplete: "
+                f"missing_scale_modules={len(missing_scales)}, "
+                f"raw_fp8_weights={len(raw_fp8_copied)} "
+                f"(e.g. {examples}). Refusing to mark unpack complete."
             )
 
         if cfg_path.is_file():
@@ -521,7 +545,8 @@ class DeepSeekV3Adapter(ModelAdapter):
         ln_map["model.norm"] = ["lm_head"]
         mtp = _mtp_layer_idx(cfg)
         if mtp is not None:
-            # enorm/hnorm feed concatenated eh_proj — not a single Norm→Linear fuse.
+            # enorm/hnorm feed concatenated eh_proj — not a single Norm→Linear fuse,
+            # so eh_proj is also excluded from QuaRot (see build_rotate_pairs).
             ln_map[f"model.layers.{mtp}.shared_head.norm"] = [
                 f"model.layers.{mtp}.shared_head.head"
             ]
@@ -571,8 +596,10 @@ class DeepSeekV3Adapter(ModelAdapter):
         if mtp is not None:
             pre_right[f"model.layers.{mtp}.embed_tokens"] = "rot"
             pre_right[f"model.layers.{mtp}.shared_head.head"] = "rot"
-            # eh_proj in_features = 2 * hidden; block-repeat rot on last dim.
-            pre_right[f"model.layers.{mtp}.eh_proj"] = "rot"
+            # Do NOT rotate eh_proj: its inputs are enorm(embed) ‖ hnorm(hidden).
+            # Those dual RMSNorm γ cannot be fused into a single Norm→Linear absorb
+            # (see build_ln_fuse_map), and diagonal γ does not commute with Hadamard.
+            # Rotating eh_proj alone would silently break MTP / speculative decoding.
         pairs.append((pre_left, pre_right))
 
         left: Dict[str, str] = {}

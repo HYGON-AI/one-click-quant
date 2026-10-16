@@ -98,7 +98,7 @@ python3 main.py --alg preprocess \
   --preprocess-gpus 8
 ```
 
-说明：官方权重是 **block FP8**（`e4m3` + `weight_scale_inv`，128×128）。流水线会先单进程流式解包到 `{save-dir}.bf16_staging`（约 1.3T+），再 8 卡按层做 QuaRot / Flex。Adapter 覆盖 MLA（`q_a/q_b`、`kv_a/kv_b`）、dense MLP（`first_k_dense_replace`）、逐专家 `experts.{i}.*`、`shared_experts`，以及 `layers.{num_hidden_layers}` 的 MTP（`shared_head`；`enorm`/`hnorm`→`eh_proj` 不做 Norm fuse）。解包后 `config.quantization_config` 会去掉。磁盘需预留 staging + 最终目录空间。
+说明：官方权重是 **block FP8**（`e4m3` + `weight_scale_inv`，128×128）。流水线会先单进程流式解包到 `{save-dir}.bf16_staging`（约 1.3T+），再 8 卡按层做 QuaRot / Flex。Adapter 覆盖 MLA（`q_a/q_b`、`kv_a/kv_b`）、dense MLP（`first_k_dense_replace`）、逐专家 `experts.{i}.*`、`shared_experts`，以及 `layers.{num_hidden_layers}` 的 MTP（`shared_head`；`enorm`/`hnorm`→`eh_proj` 不做 Norm fuse，因此 **不旋转** `eh_proj`）。缺 `weight_scale_inv` 时解包会直接报错，不会把「半解包」目录标成完成。解包后 `config.quantization_config` 会去掉。磁盘需预留 staging + 最终目录空间。
 
 ---
 
@@ -211,7 +211,7 @@ Flex 默认 `use_calib_acts: false`（权重侧 act proxy）。要用真实校�
 | [`preprocess/collect_acts_kimi_k3.py`](../preprocess/collect_acts_kimi_k3.py) | 加载 HF 模型，对目标 Linear 挂 `forward_hook`，用校准文本前向，写出 `acts.pt` |
 | [`preprocess/calib.py`](../preprocess/calib.py) | preprocess 运行时通过 `--act-stats` **读取**该文件（不负责采集） |
 
-**输出格式**：`torch.save({module_name: Tensor, ...}, acts.pt)`，key 为模块名（无 `.weight`），value 为 float CPU 张量。默认 `--reduce channel_max` 存 per-channel absmax `[K]`；`--reduce raw` 存截断后的 `[N,K]`。Flex 内部会对多维 act 再 `amax(dim=0)`。
+**输出格式**：`torch.save({module_name: Tensor, ...}, acts.pt)`，key 为模块名（无 `.weight`），value 为 float CPU 张量。默认 `--reduce channel_max` 存 per-channel absmax `[K]`；`--reduce raw` 存截断后的 `[N,K]`。加载时 `[K]` 会规范成 `[1,K]`，Flex 搜索按样本维截断后再 `amax(dim=0)`，不会把通道数误当成 batch 截断。
 
 默认 hook 与 recipe Flex 对齐：`experts.*.w2`（AWQ 用 down 输入）、`shared_experts.up_proj` / `mlp.up_proj` / `routed_expert_up_proj`。
 

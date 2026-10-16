@@ -12,6 +12,7 @@ from preprocess.io import WeightStore
 from preprocess.transforms.absorb import (
     absorb_fused_gate_up_down,
     absorb_up_down,
+    as_act_matrix,
     compute_weight_channel_max,
     expand_module_globs,
     make_scales_from_alpha_beta,
@@ -51,9 +52,7 @@ def search_alpha_awq_ssz(
 ) -> Tuple[float, float]:
     """Search alpha (beta=0) on intermediate act × down weight (UpDown subgraph)."""
     w = down_weight.float()
-    a = act.float()
-    if a.dim() > 2:
-        a = a.reshape(-1, a.shape[-1])
+    a = as_act_matrix(act)
     if a.shape[-1] != w.shape[1]:
         raise ValueError(
             f"act last dim {a.shape[-1]} != down in_features {w.shape[1]} for AWQ search"
