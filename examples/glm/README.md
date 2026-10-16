@@ -1,3 +1,13 @@
+### GLM-5.3-Channel-FP8-w8a8
+
+```bash
+  cd one-click-quant
+  python3 examples/glm/quantize_glm5_3_fp8_dynamic.py \
+  --model-path /models/GLM-5.3 \
+  --save-dir /models/GLM-5.3-Channel-FP8-w8a8 \
+  --quantize-shared-experts --quantize-first-3-layers --quantize-indexer
+```
+
 ### GLM-5.3-Channel-INT4-w4a16 / GLM-5.3-Flash-Channel-INT4-w4a16
 
 ```bash
