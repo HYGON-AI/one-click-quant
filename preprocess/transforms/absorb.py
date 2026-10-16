@@ -94,6 +94,23 @@ def compute_weight_channel_max(weight: torch.Tensor, *, along: str = "in") -> to
     raise ValueError(f"along must be 'in' or 'out', got {along}")
 
 
+def as_act_matrix(act: torch.Tensor) -> torch.Tensor:
+    """Normalize act stats to ``[N, K]`` for Flex search matmul / ``amax(dim=0)``.
+
+    ``collect_acts_*.py --reduce channel_max`` stores per-channel absmax as
+    ``[K]``; raw buffers are ``[N, K]`` (or higher rank). Treating ``[K]`` as a
+    sample axis would truncate channels when ``K > 2048`` and break scale length.
+    """
+    a = act.float()
+    if a.dim() == 0:
+        raise ValueError("act stats must be at least 1-D")
+    if a.dim() == 1:
+        return a.unsqueeze(0)
+    if a.dim() > 2:
+        return a.reshape(-1, a.shape[-1])
+    return a
+
+
 @torch.no_grad()
 def make_scales_from_alpha_beta(
     act_max: torch.Tensor,

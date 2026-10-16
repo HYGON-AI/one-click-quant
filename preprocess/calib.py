@@ -27,13 +27,22 @@ def load_act_stats(path: Optional[str | Path]) -> Dict[str, torch.Tensor]:
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"act-stats file not found: {p}")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
+    # Expect dict[str, Tensor] only; avoid pickle arbitrary-code execution.
+    try:
+        obj = torch.load(p, map_location="cpu", weights_only=True)
+    except TypeError:
+        # PyTorch < 2.0 has no weights_only=
+        obj = torch.load(p, map_location="cpu")
     if not isinstance(obj, dict):
         raise TypeError(f"act-stats must be a dict[str, Tensor], got {type(obj)}")
     out: Dict[str, torch.Tensor] = {}
     for k, v in obj.items():
         if not isinstance(v, torch.Tensor):
             raise TypeError(f"act-stats[{k!r}] is not a Tensor")
-        out[str(k)] = v.float().cpu()
+        t = v.float().cpu()
+        # channel_max collectors store [K]; Flex search expects [N, K].
+        if t.dim() == 1:
+            t = t.unsqueeze(0)
+        out[str(k)] = t
     logger.info("loaded act stats for {} modules from {}", len(out), p)
     return out

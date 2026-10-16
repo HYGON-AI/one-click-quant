@@ -377,6 +377,39 @@ class WeightStore:
         )
         logger.info("saved preprocess checkpoint to {} (total_size={})", out, total)
 
+    def _relocate_spill_outside(self, doomed: Path, preferred_parent: Path) -> None:
+        """If live spill sits under ``doomed``, move it beside ``preferred_parent``.
+
+        ``commit_inplace_and_move`` may ``rmtree(output_dir)`` while dirty tensors
+        still live only in spill chunks; spill must not remain under that path.
+        """
+        if self._spill_dir is None:
+            return
+        spill = self._spill_dir.resolve()
+        doomed_r = doomed.resolve()
+        if spill != doomed_r and doomed_r not in spill.parents:
+            return
+        dest = preferred_parent.resolve() / ".merge_spill_live"
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        logger.warning(
+            "relocating spill {} -> {} before rmtree({})",
+            spill,
+            dest,
+            doomed_r,
+        )
+        shutil.move(str(spill), str(dest))
+        dest = dest.resolve()
+
+        def _remap(path: Path) -> Path:
+            return dest / path.name
+
+        self._spill_dir = dest
+        self._spill_index = {k: _remap(p) for k, p in self._spill_index.items()}
+        self._spill_files = [_remap(p) for p in self._spill_files]
+        self._spill_refs = {_remap(p): c for p, c in self._spill_refs.items()}
+
     def commit_inplace_and_move(self, output_dir: str | os.PathLike) -> Path:
         """Rewrite dirty shards inside ``model_dir``, then rename it to ``output_dir``.
 
@@ -388,6 +421,8 @@ class WeightStore:
         src = self.model_dir.resolve()
         if out == src:
             raise ValueError(f"output_dir must differ from model_dir: {out}")
+        # Defense in depth: never rmtree a tree that still holds live spill.
+        self._relocate_spill_outside(out, preferred_parent=src)
         if out.exists():
             shutil.rmtree(out)
 

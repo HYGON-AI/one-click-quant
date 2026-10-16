@@ -228,6 +228,8 @@ def run_preprocess(
         model_dir=model_dir,
         gpus=world_size,
     )
+    if need_spill:
+        shutil.rmtree(_spill_base(Path(save_dir), create=False), ignore_errors=True)
     logger.info("preprocess finished -> {}", save_dir)
     return Path(save_dir)
 
@@ -236,18 +238,25 @@ def _shard_dir(save_dir: Path) -> Path:
     return Path(save_dir) / ".preprocess_shards"
 
 
-def _spill_base(save_dir: Path) -> Path:
+def _spill_base(save_dir: Path, *, create: bool = True) -> Path:
     """Directory for large dirty-spill chunks (may be off the model volume).
 
     Set ``PREPROCESS_SPILL_ROOT`` to a spacious filesystem (e.g. /public) when
     ``--save-dir`` sits on a small local NVMe that cannot hold staging+spill.
+
+    Default spill is a **sibling** of ``save_dir`` (not under it). Multiprocess
+    ``commit_inplace_and_move`` may ``rmtree(save_dir)`` before rewriting dirty
+    shards; keeping merge/rank spill under ``save_dir/.preprocess_shards`` would
+    delete live spill chunks and crash on reload.
     """
     env = os.environ.get("PREPROCESS_SPILL_ROOT", "").strip()
     if env:
         base = Path(env) / Path(save_dir).name
     else:
-        base = _shard_dir(Path(save_dir))
-    base.mkdir(parents=True, exist_ok=True)
+        sd = Path(save_dir).resolve()
+        base = sd.parent / f".preprocess_spill_{sd.name}"
+    if create:
+        base.mkdir(parents=True, exist_ok=True)
     return base
 
 
@@ -464,10 +473,23 @@ def run_preprocess_multiprocess(
     # Staging BF16 (~1.3 TiB) + full copy will not fit on a 3.5 TiB /module.
     # When model_dir is a *.bf16_staging tree, rewrite dirty shards in-place and
     # rename staging -> save_dir (one volume, ~1 shard of temp space).
-    if str(model_dir).endswith(".bf16_staging") or os.environ.get(
-        "PREPROCESS_INPLACE_SAVE", ""
-    ).strip() in ("1", "true", "yes"):
+    # PREPROCESS_INPLACE_SAVE alone must NOT rewrite a user original checkpoint.
+    is_staging = str(model_dir).endswith(".bf16_staging")
+    env_inplace = os.environ.get("PREPROCESS_INPLACE_SAVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if env_inplace and not is_staging:
+        raise ValueError(
+            "PREPROCESS_INPLACE_SAVE is set but model_dir is not a *.bf16_staging "
+            f"tree ({model_dir!r}); refusing to rewrite/rename the original "
+            "checkpoint. Unpack to staging first, or unset PREPROCESS_INPLACE_SAVE."
+        )
+    if is_staging:
         store.commit_inplace_and_move(save_dir)
+        # Rescue spill may have been moved under staging then renamed into save_dir.
+        shutil.rmtree(save_dir_p / ".merge_spill_live", ignore_errors=True)
     else:
         store.save(save_dir, copy_non_weights=True)
     _write_preprocess_meta(
@@ -480,9 +502,8 @@ def run_preprocess_multiprocess(
         gpus=gpus,
     )
     shutil.rmtree(shard_dir, ignore_errors=True)
-    spill_root = os.environ.get("PREPROCESS_SPILL_ROOT", "").strip()
-    if spill_root:
-        shutil.rmtree(Path(spill_root) / Path(save_dir).name, ignore_errors=True)
+    # Always drop spill tree for this save_dir (env root or sibling default).
+    shutil.rmtree(_spill_base(save_dir_p, create=False), ignore_errors=True)
     logger.info(
         "preprocess multiprocess finished -> {} "
         "(merged {} dirty, {} deleted, gpus={})",
