@@ -2,7 +2,7 @@
 
 ```bash
 cd one-click-quant
-python3 /one-click-quant/examples/deepseek/deepseek_v4_w8a8_channel.py \
+python3 examples/deepseek/deepseek_v4_w8a8_channel.py \
   --input-dir /llm_models/data/DeepSeek-V4-Pro-0813 \
   --output-dir /quant_models/DeepSeek-V4-Pro-0813-Channel-FP8-W8A8 \
   --output-format fp8-channel \
