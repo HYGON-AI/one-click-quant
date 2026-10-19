@@ -138,7 +138,48 @@ def _parse_args() -> argparse.Namespace:
         "  smoothquant_awq: - SmoothQuant AWQ quantization\n"
         "  smoothquant_gptq_awq: - SmoothQuant GPTQ + AWQ quantization\n"
         "  model_free_ptq: - Data-free model-free PTQ\n"
-        "  slimquant_ptq:  - Data-free SlimQuant PTQ (W4A8)",
+        "  slimquant_ptq:  - Data-free SlimQuant PTQ (W4A8)\n"
+        "  preprocess:     - QuaRot / Flex Smooth / Flex AWQ-SSZ weight preprocess\n"
+        "                    (writes float HF ckpt; then run any quant alg on --save-dir)",
+    )
+    p.add_argument(
+        "--recipe",
+        type=str,
+        default=None,
+        help="Preprocess recipe YAML (default: preprocess/recipes/kimi_k3.yaml)",
+    )
+    p.add_argument(
+        "--transforms",
+        type=str,
+        default=None,
+        help="Comma-separated preprocess transforms, e.g. "
+        "'quarot,flex_awq_ssz,flex_smooth_quant'",
+    )
+    p.add_argument(
+        "--preprocess-device",
+        type=str,
+        default="cpu",
+        help="Device for single-GPU/CPU preprocess (cpu or cuda:0). "
+        "Ignored when --preprocess-gpus > 1 (uses cuda:0..N-1).",
+    )
+    p.add_argument(
+        "--preprocess-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for layer-parallel preprocess weight rewrite "
+        "(1 = single process). Not MoE expert-parallel.",
+    )
+    p.add_argument(
+        "--from-preprocessed",
+        action="store_true",
+        help="Assert --model is a float preprocess output before quantizing",
+    )
+    p.add_argument(
+        "--act-stats",
+        type=str,
+        default=None,
+        help="Optional torch.save dict[str,Tensor] of calib activations for "
+        "Flex transforms (requires use_calib_acts: true in recipe)",
     )
     p.add_argument(
         "--needs-data",
@@ -259,13 +300,27 @@ def main() -> None:
         run_analysis(args)
         return
 
+    if args.alg == "preprocess":
+        logger.info("running preprocess via template")
+        _execute_template("templates/preprocess_ptq.py", args)
+        return
+
+    if not args.model:
+        raise SystemExit("--model is required")
+
+    if args.from_preprocessed:
+        from preprocess.pipeline import assert_float_checkpoint
+
+        assert_float_checkpoint(args.model)
+        logger.info("from-preprocessed: float weight check ok")
+
     config = _load_model_config(args.model)
     architecture = _get_architecture(config)
     signature = _get_model_signature(config)
     logger.info("architecture=%s, signature=%s, scheme=%s", architecture, signature, args.scheme)
 
     template_path, extra_kwargs = _lookup_template(architecture, signature, args.scheme)
-    if args.alg not in ("model_free_ptq", "slimquant_ptq"):
+    if args.alg not in ("model_free_ptq", "slimquant_ptq", "preprocess"):
         for key, value in extra_kwargs.items():
             if getattr(args, key, None) is None:
                 setattr(args, key, value)
