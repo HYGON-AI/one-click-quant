@@ -14,17 +14,24 @@ from preprocess.io import WeightStore
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+def _pattern_matches(name: str, pat: str) -> bool:
+    """Match one include pattern against a module or tensor name.
+
+    ``re:`` prefixes are Python regular expressions (``re.search``), matching
+    ``match_include``. Other patterns are fnmatch globs: ``.`` is literal and
+    ``*`` is a wildcard. A ``re:`` body is never passed through glob rewriting,
+    so ``\\d``, ``+``, groups, and already-escaped ``\\.`` keep their meaning.
+    """
+    if pat.startswith("re:"):
+        return re.search(pat[3:], name) is not None
+    if fnmatch.fnmatch(name, pat):
+        return True
+    return re.fullmatch(pat.replace(".", r"\.").replace("*", r".*"), name) is not None
+
+
 def match_include(name: str, patterns: Sequence[str]) -> bool:
     """Match HF-style include with ``*`` wildcards (also accepts ``re:`` prefixes)."""
-    for pat in patterns:
-        if pat.startswith("re:"):
-            if re.search(pat[3:], name):
-                return True
-        elif fnmatch.fnmatch(name, pat) or re.fullmatch(
-            pat.replace(".", r"\.").replace("*", r".*"), name
-        ):
-            return True
-    return False
+    return any(_pattern_matches(name, pat) for pat in patterns)
 
 
 def expand_module_globs(weights: WeightStore, patterns: Sequence[str], suffix: str = ".weight") -> List[str]:
@@ -32,6 +39,7 @@ def expand_module_globs(weights: WeightStore, patterns: Sequence[str], suffix: s
 
     Matches both ``{mod}{suffix}`` (default ``.weight``) and bare fused keys
     (e.g. ``...experts.gate_up_proj``) when the pattern names that module.
+    Patterns use the same rules as ``match_include``: globs, or ``re:`` regex.
     """
     out = []
     seen = set()
@@ -41,18 +49,11 @@ def expand_module_globs(weights: WeightStore, patterns: Sequence[str], suffix: s
             mods.append(name[: -len(suffix)])
         mods.append(name)
         for mod in mods:
-            for pat in patterns:
-                p = pat[3:] if pat.startswith("re:") else pat
-                if fnmatch.fnmatch(mod, p) or re.fullmatch(
-                    p.replace(".", r"\.").replace("*", r".*"), mod
-                ):
-                    if name not in seen:
-                        out.append(name)
-                        seen.add(name)
-                    break
-            else:
-                continue
-            break
+            if any(_pattern_matches(mod, pat) for pat in patterns):
+                if name not in seen:
+                    out.append(name)
+                    seen.add(name)
+                break
     return out
 
 
