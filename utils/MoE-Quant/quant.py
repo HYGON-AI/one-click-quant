@@ -80,6 +80,17 @@ def parse_args():
             "quantization, appended to the adapter's structural defaults."
         ),
     )
+    parser.add_argument(
+        "--force_int8",
+        type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
+        default=None,
+        metavar="PATTERN[,PATTERN...]",
+        help=(
+            "Comma-separated module names or 're:<regex>' patterns (same syntax as "
+            "--ignore) GPTQ-quantized to INT8 regardless of --bits; every other "
+            "non-ignored Linear uses --bits. --ignore still wins over --force_int8."
+        ),
+    )
     # Save params
     parser.add_argument("--save_dir", type=str, default=None, help="where to save quantized model.")
     # Logging params
@@ -339,6 +350,8 @@ def save_quantization_metadata(args, ignore_rules):
                 "group_size": args.group_size,
                 # Fully resolved; the packer replays this into quantization_config.ignore.
                 "ignore": list(ignore_rules),
+                # Layers matching these patterns were GPTQ-quantized to INT8.
+                "force_int8": list(args.force_int8 or []),
                 "quantize_only_experts": args.quantize_only_experts,
             },
             os.path.join(args.save_dir, "metadata.pt"),
@@ -467,9 +480,9 @@ def load_moe_block(
         del rank_state_dict
 
 
-def quantize_shared_handle(handle_name, handle, args):
-    dist_utils.print_on_main(f"Quantizing layer {handle_name}")
-    qweight, scale, zero, dequantized_weight = quantize(handle=handle, bits=args.bits)
+def quantize_shared_handle(handle_name, handle, args, bits):
+    dist_utils.print_on_main(f"Quantizing layer {handle_name} (bits={bits})")
+    qweight, scale, zero, dequantized_weight = quantize(handle=handle, bits=bits)
 
     if args.log_error:
         if handle.has_hessian_issues():
@@ -487,7 +500,7 @@ def quantize_shared_handle(handle_name, handle, args):
     if args.save_dir and dist_utils.is_main():
         os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
         torch.save(
-            {"qweight": qweight, "scale": scale, "zero": zero},
+            {"qweight": qweight, "scale": scale, "zero": zero, "bits": bits},
             os.path.join(args.save_dir, handle_name, "quantized_weight.pt"),
         )
     handle.layer.weight.data = dequantized_weight
@@ -499,9 +512,9 @@ def quantize_shared_handle(handle_name, handle, args):
     )
 
 
-def quantize_expert_handle(handle_name, handle, args):
-    message = f"Quantizing layer {handle_name}\n"
-    qweight, scale, zero, dequantized_weight = quantize(handle, args.bits)
+def quantize_expert_handle(handle_name, handle, args, bits):
+    message = f"Quantizing layer {handle_name} (bits={bits})\n"
+    qweight, scale, zero, dequantized_weight = quantize(handle, bits)
     message += f"Tokens collected: {handle.tokens_collected}.\n"
 
     if args.log_error:
@@ -518,7 +531,7 @@ def quantize_expert_handle(handle_name, handle, args):
     if args.save_dir:
         os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
         torch.save(
-            {"qweight": qweight, "scale": scale, "zero": zero},
+            {"qweight": qweight, "scale": scale, "zero": zero, "bits": bits},
             os.path.join(args.save_dir, handle_name, "quantized_weight.pt"),
         )
     handle.layer.weight.data = dequantized_weight
@@ -542,13 +555,17 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
     dtype = runtime.dtype
     adapter = model_context.adapter
     model = model_context.model
-    ignore_rules = adapter.resolve_ignore(args.ignore, args.quantize_only_experts)
+    ignore_rules = adapter.resolve_ignore(
+        args.ignore, args.quantize_only_experts, force_int8=args.force_int8
+    )
     dist_utils.print_on_main(
         f"[INFO] quantization scope: {len(ignore_rules)} ignore rule(s), "
         "every other Linear becomes a GPTQ target"
     )
     for rule in ignore_rules:
         dist_utils.print_on_main(f"        ignore: {rule}")
+    for rule in args.force_int8 or []:
+        dist_utils.print_on_main(f"        force_int8: {rule}")
     inputs = calibration.inputs
     position_ids = calibration.position_ids
     resume_block_idx = get_resume_block_idx(args.save_dir, adapter) if args.resume else 0
@@ -602,7 +619,8 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
             num_issue_non_invertible = 0
             for handle_name, handle in shared_handles.items():
                 issue_zero_samples, issue_nan_hessian, issue_non_invertible = quantize_shared_handle(
-                    handle_name, handle, args
+                    handle_name, handle, args,
+                    adapter.resolve_layer_bits(handle_name, args.bits, args.force_int8),
                 )
                 num_issue_zero_samples += issue_zero_samples
                 num_issue_nan_hessian += issue_nan_hessian
@@ -629,7 +647,8 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
                 for handle_name, handle in expert_handles.items():
                     message, issue_zero_samples, issue_nan_hessian, issue_non_invertible = quantize_expert_handle(
-                        handle_name, handle, args
+                        handle_name, handle, args,
+                        adapter.resolve_layer_bits(handle_name, args.bits, args.force_int8),
                     )
                     rank_expert_message += message
                     num_issue_zero_samples += issue_zero_samples

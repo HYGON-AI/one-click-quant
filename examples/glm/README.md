@@ -87,5 +87,12 @@ python quantize_glm5_3_int4_channel.py \
   --input-dir  /llm-models/GLM-5.3 \
   --output-dir /quant_models/GLM-5.3-CHANNEL-INT4-w4a8
 ```
-
+若 MTP routed experts 也需要 INT4，将运行命令改为：
+```
+cd /quant_models/one-click-quant/examples/glm
+python quantize_glm5_3_int4_channel.py \
+  --mtp-int4 \
+  --input-dir  /llm-models/GLM-5.3 \
+  --output-dir /quant_models/GLM-5.3-CHANNEL-INT4-w4a8
+```
 

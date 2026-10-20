@@ -45,8 +45,9 @@ GLM-5.3 (GlmMoeDsaForCausalLM) BF16 / FP8 -> 混合精度 INT4/INT8 W4A8+W8A8 �
   - indexer wk 在 CUDA 上会与 weights_proj 融合成 bf16 的 wk_weights_proj, 而 INT8 wk 无法
     装进该融合参数; DCU 不融合。CUDA 上需设置 SGLANG_DISABLE_DSA_INDEXER_FUSION=1。
   - MTP 层在运行时不叫 model.layers.78: 解码块在 model.decoder.*, eh_proj/enorm/hnorm/
-    shared_head 在 model.*。因此 ignore 规则不带 layers.N 锚点, group_int4 的 target 用显式
-    层号 (3..77), MTP experts 自然落到 group_int8。脚本启动时会用运行时模块名做自检。
+    shared_head 在 model.*。因此 ignore 规则不带 layers.N 锚点; group_int4 的主干 target
+    用显式层号 (3..77), --mtp-int4 时另加 model.decoder.mlp.experts.* target。
+    脚本启动时会用运行时模块名做自检。
 
 用法
 ====
@@ -235,18 +236,28 @@ def _weights(num_bits: int) -> dict:
 
 
 def int4_target_regex(layout: Layout) -> str:
+    backbone_layers = (i for i in layout.int4_layers if i < layout.num_hidden_layers)
     return (
-        r"re:.*\.layers\.(?:" + "|".join(str(i) for i in layout.int4_layers)
+        r"re:.*\.layers\.(?:" + "|".join(str(i) for i in backbone_layers)
         + r")\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
     )
 
 
+def int4_target_rules(layout: Layout) -> list[str]:
+    targets = [int4_target_regex(layout)]
+    if any(i in layout.int4_layers for i in layout.mtp_layers):
+        targets.append(
+            r"re:^model\.decoder\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
+        )
+    return targets
+
+
 def build_compression_config(layout: Layout, mode: str) -> dict:
-    """group_int4: 主干 routed experts (显式层号); group_int8: 其余未 ignore 的 Linear。"""
+    """group_int4: 主干及可选 MTP routed experts; group_int8: 其余未 ignore 的 Linear。"""
     return {
         "config_groups": {
             "group_int4": {
-                "targets": [int4_target_regex(layout)],
+                "targets": int4_target_rules(layout),
                 "input_activations": _int8_activations() if mode == "w4a8" else None,
                 "output_activations": None,
                 "format": "pack-quantized",

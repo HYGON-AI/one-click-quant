@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import gc
+import functools
+import re
 import json
 import argparse
 from collections import defaultdict
@@ -53,7 +55,28 @@ def parse_args():
         type=int,
         choices=[16, 8],
         default=16,
-        help="Activation precision declared in quantization_config; 16 keeps weight-only W4A16, 8 declares dynamic per-token INT8 activations.",
+        help="Activation precision declared in quantization_config; 16 keeps weight-only W*A16, 8 declares dynamic per-token INT8 activations (W8A8 / W4A8).",
+    )
+    mtp_group = parser.add_mutually_exclusive_group()
+    mtp_group.add_argument(
+        "--mtp-int8",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "RTN-quantize the non-ignored Linears of the MTP layer (which bypasses "
+            "GPTQ) to INT8 channel-wise instead of copying them as bf16. Only for "
+            "adapters that support it (GLM-5.3 / GLM-5.3-Flash)."
+        ),
+    )
+    mtp_group.add_argument(
+        "--mtp-int4",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "RTN-quantize MTP routed experts to channel-wise INT4, and other "
+            "non-ignored MTP Linears to INT8. Supported by GLM-5.3 (non-Flash). "
+            "Mutually exclusive with --mtp-int8."
+        ),
     )
     args = parser.parse_args()
     return args
@@ -119,7 +142,8 @@ def pack_weight(
             raise ValueError("int-quantized format requires symmetric quantization.")
         compressed_data = {
             "weight": qweight_shifted.contiguous(),
-            "weight_scale": scale,
+            # W8A8 loaders allocate a float32 per-channel scale.
+            "weight_scale": scale.to(torch.float32),
         }
         return compressed_data
 
@@ -139,12 +163,109 @@ def pack_weight(
     return compressed_data
 
 
-def _packing_format_for(args: argparse.Namespace) -> str:
-    """Choose the compressed-tensors on-disk format for the current recipe."""
-    if args.activation_bits == 8:
+def pack_int8_rtn(
+    weight: torch.Tensor,
+    packing_format: str,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """RTN channel-wise INT8 for layers that bypass GPTQ (``--mtp-int8``).
+
+    Same formula as the reference quantize_glm5_3_flash_int4_channel.py
+    (abs-max / 127, round(w / s)). It runs on the accelerator like the
+    reference: FP8 sources produce many exact .5 ties, and CPU/GPU division
+    differ by 1 ulp there.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    weight = weight.to(device=device, dtype=torch.float32)
+    scale = weight.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 127.0
+    if packing_format != "int-quantized":
+        # WNA16 loaders keep the scale in the model dtype.
+        scale = scale.to(dtype)
+    qweight = torch.round(weight / scale.float()).clamp(-127, 127) + 128
+    return pack_weight(
+        {
+            "qweight": qweight.to(torch.uint8).cpu(),
+            "scale": scale.cpu(),
+            "zero": torch.full_like(scale, 128.0).cpu(),
+        },
+        8, True, None, packing_format=packing_format,
+    )
+
+
+def _packing_format_for(args: argparse.Namespace, bits: int) -> str:
+    """Choose the compressed-tensors on-disk format for one layer's bit width."""
+    if args.activation_bits == 8 and bits == 8:
         # vLLM's CompressedTensorsW8A8Int8MoEMethod expects `int-quantized`.
         return "int-quantized"
+    # WNA16 and W4A8 (HCUCompressedTensorsW4A8Int8DynamicMoE) both read int32-packed weights.
     return "pack-quantized"
+
+
+def pack_int4_rtn(weight: torch.Tensor, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Channel-wise INT4 RTN with the stored scale rounded before quantizing.
+
+    Matches quantize_glm5_3_int4_channel.py: absmax/7, bf16 scale, signed
+    [-8, 7] codes, and eight offset-binary nibbles per int32 along input dim.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 8 != 0:
+        raise ValueError("MTP INT4 requires a 2D weight with input dimension divisible by 8.")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    weight = weight.to(device=device, dtype=torch.float32)
+    scale = (weight.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 7.0).to(dtype)
+    qweight = torch.round(weight / scale.float()).clamp(-8, 7) + 8
+    return pack_weight(
+        {
+            "qweight": qweight.to(torch.uint8).cpu(),
+            "scale": scale.cpu(),
+            "zero": torch.full_like(scale, 8.0).cpu(),
+        },
+        4, True, None, packing_format="pack-quantized",
+    )
+
+
+def _quantize_mtp(args: argparse.Namespace) -> bool:
+    return getattr(args, "mtp_int8", False) or getattr(args, "mtp_int4", False)
+
+
+def output_name_for(adapter: ModelAdapter, layer_name: str, weight_map: dict[str, str]) -> str:
+    """Translate a modelling-side GPTQ directory name into its checkpoint name."""
+    mapped = adapter.checkpoint_keys_for_model_key(layer_name, weight_map)
+    return mapped[0] if len(mapped) == 1 else layer_name
+
+
+_LEAF_ORDER = ("gate_proj", "up_proj", "down_proj")
+
+
+def build_layer_targets(names: list[str]) -> list[str]:
+    """Collapse module names into ``re:`` targets, one per (sub-path, layer set).
+
+    e.g. ``...layers.3.mlp.experts.0.gate_proj`` .. ``layers.44.mlp.experts.287.down_proj``
+    -> ``re:.*\\.layers\\.(?:3|...|44)\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|up_proj|down_proj)$``
+    """
+    layers_by_stem: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+    exact = []
+    for name in names:
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.(.+)$", name)
+        if match is None:
+            exact.append(name)
+            continue
+        parts = match.group(2).split(".")
+        stem = r"\.".join(r"\d+" if p.isdigit() else re.escape(p) for p in parts[:-1])
+        layers_by_stem[stem][parts[-1]].add(int(match.group(1)))
+
+    targets = []
+    for stem, leaves in layers_by_stem.items():
+        leaves_by_layers: dict[tuple[int, ...], list[str]] = defaultdict(list)
+        for leaf, layers in leaves.items():
+            leaves_by_layers[tuple(sorted(layers))].append(leaf)
+        for layers, leaf_names in leaves_by_layers.items():
+            leaf_names.sort(key=lambda x: (_LEAF_ORDER.index(x) if x in _LEAF_ORDER else len(_LEAF_ORDER), x))
+            escaped = [re.escape(leaf) for leaf in leaf_names]
+            leaf_re = escaped[0] if len(escaped) == 1 else "(?:" + "|".join(escaped) + ")"
+            stem_re = rf"{stem}\." if stem else ""
+            layer_re = "|".join(str(i) for i in layers)
+            targets.append(rf"re:.*\.layers\.(?:{layer_re})\.{stem_re}{leaf_re}$")
+    return targets + sorted(exact)
 
 
 def resolve_ignore_for_packing(args: argparse.Namespace, adapter: ModelAdapter) -> tuple[str, list[str]]:
@@ -153,17 +274,59 @@ def resolve_ignore_for_packing(args: argparse.Namespace, adapter: ModelAdapter) 
     Replays the list recorded in ``metadata.pt`` so the packed ``ignore`` can
     never disagree with the on-disk ``quantized_weight.pt`` set; metadata
     without an ``ignore`` key falls back to the legacy flag-driven list.
+    Either MTP quantization flag drops the adapter's blanket MTP rules.
     """
     recorded = getattr(args, "ignore", None)
     if recorded:
-        return "recorded", list(recorded)
-    return adapter.get_quantization_ignore(args.quantize_only_experts)
+        rule_name, rules = "recorded", list(recorded)
+    else:
+        rule_name, rules = adapter.get_quantization_ignore(args.quantize_only_experts)
+    if _quantize_mtp(args):
+        rules = adapter.mtp_int8_ignore(rules)
+    return rule_name, rules
+
+
+def _config_group(
+    args: argparse.Namespace,
+    targets: list[str],
+    bits: int,
+    input_activations: Optional[dict[str, Any]],
+    packing_format: Optional[str] = None,
+) -> dict[str, Any]:
+    weight_strategy = "channel" if args.group_size is None else "group"
+    # Channel-wise is expressed on disk as `-1` (compressed-tensors canonical
+    # sentinel). vLLM's CompressedTensorsWNA16MoEMethod reads the value
+    # verbatim and asserts `== -1` for 8-bit, so `null` breaks W8A16 loading.
+    canonical_group_size = args.group_size if args.group_size is not None else -1
+    group = {
+        "input_activations": input_activations,
+        "output_activations": None,
+        "targets": targets,
+        "weights": {
+            "actorder": None,
+            "block_structure": None,
+            "dynamic": False,
+            "group_size": canonical_group_size,
+            "num_bits": bits,
+            "observer": "minmax",
+            "observer_kwargs": {},
+            "strategy": weight_strategy,
+            "symmetric": True,
+            "type": "int"
+        }
+    }
+    if packing_format is not None:
+        # Per-group override for mixed-precision checkpoints.
+        group["format"] = packing_format
+    return group
 
 
 def prepare_quantization_config(
     args: argparse.Namespace,
     adapter: ModelAdapter,
+    layer_bits: dict[str, int],
 ) -> dict[str, Any]:
+    """``layer_bits`` maps every packed GPTQ layer (checkpoint name) to its bit width."""
     input_activations = None
     if args.activation_bits == 8:
         input_activations = {
@@ -178,36 +341,42 @@ def prepare_quantization_config(
         }
 
     ignore_rule, ignored_modules = resolve_ignore_for_packing(args, adapter)
-    weight_strategy = "channel" if args.group_size is None else "group"
-    # Channel-wise is expressed on disk as `-1` (compressed-tensors canonical
-    # sentinel). vLLM's CompressedTensorsWNA16MoEMethod reads the value
-    # verbatim and asserts `== -1` for 8-bit, so `null` breaks W8A16 loading.
-    canonical_group_size = args.group_size if args.group_size is not None else -1
-    packing_format = _packing_format_for(args)
+    bits_used = set(layer_bits.values()) | ({8} if _quantize_mtp(args) else set())
+    if getattr(args, "mtp_int4", False):
+        bits_used.add(4)
+    if len(bits_used) <= 1:
+        bits = bits_used.pop() if bits_used else args.bits
+        packing_format = _packing_format_for(args, bits)
+        config_groups = {
+            "group_0": _config_group(args, ["Linear"], bits, input_activations),
+        }
+    else:
+        # Mixed precision (--force_int8 / MTP RTN): the low-bit layers are
+        # listed explicitly, every other non-ignored Linear falls back to INT8.
+        low_bits = sorted(bits_used - {8})
+        if len(low_bits) != 1:
+            raise ValueError(f"Unsupported mixed bit widths {sorted(bits_used)}.")
+        low_bits = low_bits[0]
+        low_bit_names = sorted(name for name, bits in layer_bits.items() if bits == low_bits)
+        low_bit_targets = build_layer_targets(low_bit_names)
+        if getattr(args, "mtp_int4", False):
+            # The MTP bypasses GPTQ and is absent from layer_bits. Include both
+            # checkpoint and NextN runtime names in the INT4 scheme explicitly.
+            low_bit_targets.extend(adapter.mtp_int4_targets())
+        packing_format = "pack-quantized"
+        config_groups = {
+            f"group_int{low_bits}": _config_group(
+                args, low_bit_targets, low_bits, input_activations,
+                _packing_format_for(args, low_bits),
+            ),
+            "group_int8": _config_group(
+                args, ["Linear"], 8, input_activations, _packing_format_for(args, 8),
+            ),
+        }
     print(f"[INFO] quantization_config ignore rule={ignore_rule}, count={len(ignored_modules)}")
-    print(f"[INFO] quantization_config format={packing_format}")
+    print(f"[INFO] quantization_config format={packing_format}, groups={list(config_groups)}")
     return {
-        "config_groups": {
-            "group_0": {
-                "input_activations": input_activations,
-                "output_activations": None,
-                "targets": [
-                    "Linear"
-                ],
-                "weights": {
-                    "actorder": None,
-                    "block_structure": None,
-                    "dynamic": False,
-                    "group_size": canonical_group_size,
-                    "num_bits": args.bits,
-                    "observer": "minmax",
-                    "observer_kwargs": {},
-                    "strategy": weight_strategy,
-                    "symmetric": True,
-                    "type": "int"
-                }
-            }
-        },
+        "config_groups": config_groups,
         "format": packing_format,
         "ignore": ignored_modules,
         "kv_cache_scheme": None,
@@ -227,6 +396,8 @@ def main():
         delattr(config, "quantization_config")
     adapter = get_model_adapter(config)
     print(f"[INFO] model adapter={adapter.name}")
+    if args.mtp_int4 and not adapter.supports_mtp_int4:
+        raise ValueError(f"--mtp-int4 is not supported by the {adapter.name} adapter.")
     adapter.prepare_config(config, world_size=1)
 
     with init_empty_weights():
@@ -242,11 +413,16 @@ def main():
     args.group_size = metadata["group_size"]
     args.quantize_only_experts = metadata.get("quantize_only_experts", False)
     args.ignore = metadata.get("ignore")
+    args.force_int8 = metadata.get("force_int8") or []
     # Currently we do not support asymmetric quantization
     args.sym = True
     adapter.validate_packing_args(args)
-    packing_format = _packing_format_for(args)
-    print(f"[INFO] packing_format={packing_format}")
+    if args.mtp_int8 and not adapter.supports_mtp_int8:
+        raise ValueError(f"--mtp-int8 is not supported by the {adapter.name} adapter.")
+    print(
+        f"[INFO] default bits={args.bits}, force_int8={args.force_int8}, "
+        f"mtp_int8={args.mtp_int8}, mtp_int4={args.mtp_int4}"
+    )
 
     # Resolve input weights through the HuggingFace safetensors index instead of
     # assuming DeepSeek's model-xxxxx-of-000163 naming convention.
@@ -288,6 +464,30 @@ def main():
             raise ValueError(
                 "Incomplete routed-expert GPTQ output: " + "; ".join(details)
             )
+
+    # Per-layer bit widths, keyed by modelling-side directory name; the
+    # quantized_weight.pt "bits" entry is cross-checked while packing.
+    layer_bits = {
+        name: adapter.resolve_layer_bits(name, args.bits, args.force_int8)
+        for names in quantized_layer_names.values()
+        for name in names
+    }
+    for name, bits in layer_bits.items():
+        if args.activation_bits == 8 and bits != 8 and not adapter.is_routed_expert(name):
+            raise ValueError(
+                f"{name} is {bits}-bit but W{bits}A8 is only supported for routed "
+                "experts; add it to --force_int8 (or --ignore) when quantizing."
+            )
+    if args.group_size is not None and (_quantize_mtp(args) or (
+        args.activation_bits == 8 and 8 in layer_bits.values()
+    )):
+        raise ValueError(
+            "INT8 W8A8 layers and MTP RTN quantization are channel-wise only; quantize "
+            "without --group_size."
+        )
+    for bits in sorted(set(layer_bits.values())):
+        count = sum(b == bits for b in layer_bits.values())
+        print(f"[INFO] {count} GPTQ layer(s) bits={bits} format={_packing_format_for(args, bits)}")
     safetensors_index = {}
     # Prepare directory to save packed weights
     os.makedirs(args.packed_model_path, exist_ok=True)
@@ -338,12 +538,10 @@ def main():
         logical_block_keys = adapter.logical_block_keys(block, block_idx)
         # Directory names are modelling-side, `logical_block_keys` are
         # checkpoint-side; translate before matching (they differ on GLM-5.3-Flash).
-        quantized_output_names: dict[str, str] = {}
-        for layer_name in quantized_layer_names[block_idx]:
-            mapped = adapter.checkpoint_keys_for_model_key(layer_name, weight_map)
-            quantized_output_names[layer_name] = (
-                mapped[0] if len(mapped) == 1 else layer_name
-            )
+        quantized_output_names: dict[str, str] = {
+            layer_name: output_name_for(adapter, layer_name, weight_map)
+            for layer_name in quantized_layer_names[block_idx]
+        }
         quantized_weight_keys = {
             f"{output_name}.weight"
             for output_name in quantized_output_names.values()
@@ -378,12 +576,20 @@ def main():
                 weights_only=True,
                 map_location="cpu"
             )
+            bits = layer_bits[layer_name]
+            saved_bits = weight_state_dict.get("bits")
+            if saved_bits is not None and int(saved_bits) != bits:
+                raise ValueError(
+                    f"{layer_name} was quantized with bits={int(saved_bits)} but "
+                    f"metadata.pt (bits={args.bits}, force_int8={args.force_int8}) "
+                    f"resolves to bits={bits}."
+                )
             packed_weight_state_dict = pack_weight(
                 weight_state_dict,
-                args.bits,
+                bits,
                 args.sym,
                 args.group_size,
-                packing_format=packing_format,
+                packing_format=_packing_format_for(args, bits),
             )
             output_name = quantized_output_names[layer_name]
             block_state_dict.pop(f"{output_name}.weight", None)
@@ -434,6 +640,18 @@ def main():
     )
     for key in final_tensor_keys:
         safetensors_index[key] = current_output_shard_path
+    extra_kwargs = {}
+    if _quantize_mtp(args):
+        int8_format = _packing_format_for(args, 8)
+        _, mtp_ignore = resolve_ignore_for_packing(args, adapter)
+        extra_kwargs = {
+            "mtp_int8_ignore": mtp_ignore,
+            "mtp_pack_int8": functools.partial(
+                pack_int8_rtn, packing_format=int8_format, dtype=dtype
+            ),
+        }
+        if args.mtp_int4:
+            extra_kwargs["mtp_pack_int4"] = functools.partial(pack_int4_rtn, dtype=dtype)
     current_output_shard_id = adapter.save_extra_weights(
         weight_dir,
         weight_map,
@@ -441,6 +659,7 @@ def main():
         current_output_shard_id + 1,
         num_output_shards,
         safetensors_index,
+        **extra_kwargs,
     )
     # Save safetensors index
     with open(os.path.join(args.packed_model_path, "model.safetensors.index.json"), "w") as f:
@@ -451,7 +670,14 @@ def main():
         )
         f.write("\n")
     # Add quantization metadata
-    quantization_config = prepare_quantization_config(args, adapter)
+    quantization_config = prepare_quantization_config(
+        args,
+        adapter,
+        {
+            output_name_for(adapter, name, weight_map): bits
+            for name, bits in layer_bits.items()
+        },
+    )
     adapter.set_quantization_config(config, quantization_config)
     # Save configs
     config.save_pretrained(args.packed_model_path)
