@@ -1,0 +1,46 @@
+# Qwen3.8-Flash-Next (qwen4_exp) preprocess recipe
+#
+# Adapter: preprocess/adapters/qwen3_8_flash_next.py
+# Checkpoint is already BF16 — no MXFP4 unpack.
+#
+# QuaRot rotation is OFF: residual is hyper-connection 4×H with unfused Gemma
+# hc_norm; Hadamard does not commute with diagonal (1+γ). Adapter returns
+# empty rotate pairs (整段不转). fuse_ln still only folds
+# mtp.pre_fc_norm_embedding → fc_embedding when quarot is listed with fuse_ln.
+#
+# Flex AWQ covers shared_expert (2D) and fused experts (up = second half of gate_up).
+# Flex Smooth on layer hc_norm is OFF for A/B (elementwise mix + prior dump
+# collapse). MTP pre_fc norms remain as optional Smooth seeds.
+
+adapter: qwen3_8_flash_next
+
+unpack_mxfp4: false
+
+transforms:
+  # quarot omitted: empty rotate pairs; keep out of default path for clarity
+  - flex_awq_ssz
+  - flex_smooth_quant
+
+# Kept for optional `--transforms quarot,...` (fuse_ln only; no weight rotate).
+quarot:
+  block_size: 32
+  seed: 1234
+  fuse_ln: true
+
+flex_awq_ssz:
+  search_step: 0.1
+  ssz_step: 10
+  use_calib_acts: false
+  include:
+    - model.language_model.layers.*.mlp.shared_expert.up_proj
+    - model.language_model.layers.*.mlp.experts.gate_up_proj
+    - mtp.layers.0.mlp.shared_expert.up_proj
+    - mtp.layers.0.mlp.experts.gate_up_proj
+
+flex_smooth_quant:
+  search_step: 0.1
+  use_calib_acts: false
+  include:
+    # hc_norm Smooth disabled (A/B vs prior collapse). MTP-only:
+    - mtp.pre_fc_norm_embedding
+    - mtp.pre_fc_norm_hidden

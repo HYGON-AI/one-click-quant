@@ -20,7 +20,7 @@ from __future__ import annotations
 import gc
 import os
 import re
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -395,6 +395,36 @@ def _load_extra_tensors(
             yield shard, tensors
 
 
+def _quantize_mtp_tensors(
+    tensors: Dict[str, torch.Tensor],
+    ignore_rules: List[str],
+    pack_int8: Callable[[torch.Tensor], Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
+    """RTN INT8 every non-ignored MTP Linear weight, popping its source tensors.
+
+    MTP layer 45 cannot be GPTQ-calibrated (Transformers drops it on load), so
+    this mirrors the reference FP8 -> fp32 dequant -> channelwise INT8 recipe.
+    """
+    from .base import ModelAdapter
+
+    packed: Dict[str, torch.Tensor] = {}
+    for key in sorted(tensors):
+        if not (key.startswith(_MTP_LAYER_PREFIX) and key.endswith(".weight")):
+            continue
+        weight = tensors[key]
+        module_name = key[: -len(".weight")]
+        if weight.ndim != 2 or ModelAdapter.match_ignore(module_name, ignore_rules):
+            continue
+        scale_inv = tensors.pop(f"{key}_scale_inv", None)
+        if scale_inv is not None:
+            weight = quant_utils.dequantize_weight_from_fp8(weight.float(), scale_inv.float())
+        packed.update(
+            {f"{module_name}.{name}": value for name, value in pack_int8(weight.float()).items()}
+        )
+        del tensors[key]
+    return packed
+
+
 def save_extra_weights(
     weight_dir: str,
     weight_map: Dict[str, str],
@@ -402,8 +432,15 @@ def save_extra_weights(
     next_shard_id: int,
     num_output_shards: int,
     safetensors_index: Dict[str, str],
+    mtp_int8_ignore: Optional[List[str]] = None,
+    mtp_pack_int8: Optional[Callable[[torch.Tensor], Dict[str, torch.Tensor]]] = None,
 ) -> int:
-    """Dequantize + copy MTP (layer 45) and visual tensors into their own shards."""
+    """Copy MTP (layer 45) and visual tensors into their own shards.
+
+    Everything is dequantized to bf16 unless ``mtp_pack_int8`` is given, in
+    which case MTP Linears outside ``mtp_int8_ignore`` are RTN INT8-packed.
+    """
+    num_mtp_int8 = 0
     for source_shard, tensors in _load_extra_tensors(weight_dir, weight_map):
         packed_keys = sorted(
             key for key in tensors if key.endswith(".weight_packed")
@@ -418,6 +455,10 @@ def save_extra_weights(
                 f"GLM-5.3-Flash extra shard {source_shard} has an FP8 tensor "
                 "without matching weight_scale_inv."
             )
+        mtp_packed: Dict[str, torch.Tensor] = {}
+        if mtp_pack_int8 is not None:
+            mtp_packed = _quantize_mtp_tensors(tensors, mtp_int8_ignore or [], mtp_pack_int8)
+            num_mtp_int8 += sum(key.endswith(".weight_scale") for key in mtp_packed)
         quant_utils.dequantize_state_dict(tensors, torch.bfloat16)
         for key, tensor in list(tensors.items()):
             if (
@@ -425,6 +466,7 @@ def save_extra_weights(
                 and tensor.dtype not in (torch.float32, torch.bfloat16)
             ):
                 tensors[key] = tensor.to(torch.bfloat16)
+        tensors.update(mtp_packed)
         output_name = (
             f"model-{next_shard_id:05}-of-{num_output_shards:05}.safetensors"
         )
@@ -432,8 +474,10 @@ def save_extra_weights(
         for key in tensors:
             safetensors_index[key] = output_name
         next_shard_id += 1
-        del tensors
+        del tensors, mtp_packed
         gc.collect()
+    if mtp_pack_int8 is not None:
+        print(f"[INFO] MTP layer 45 RTN INT8 Linear weights: {num_mtp_int8}")
     return next_shard_id
 
 

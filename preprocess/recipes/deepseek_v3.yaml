@@ -1,0 +1,49 @@
+# DeepSeek-V3 preprocess recipe
+#
+# Adapter: preprocess/adapters/deepseek_v3.py
+# Official weights are block FP8 — streaming unpack to ``{save-dir}.bf16_staging``
+# before multi-GPU transforms (same pattern as Kimi MXFP4).
+#
+# QuaRot: RMSNorm fuse + Hadamard on hidden / q_lora / kv_lora (MLA).
+# Flex AWQ: dense mlp.up_proj, shared_experts.up_proj, experts.*.up_proj.
+# Flex Smooth: Norm seeds; consumers from adapter LN map.
+
+adapter: deepseek_v3
+
+unpack_fp8: true
+
+transforms:
+  - quarot
+  - flex_awq_ssz
+  - flex_smooth_quant
+
+quarot:
+  block_size: 32
+  seed: 1234
+  fuse_ln: true
+  # Optional smoke:
+  # max_layers: 4
+
+flex_awq_ssz:
+  search_step: 0.1
+  ssz_step: 10
+  use_calib_acts: false
+  include:
+    - model.layers.*.mlp.up_proj
+    - model.layers.*.mlp.shared_experts.up_proj
+    - model.layers.*.mlp.experts.*.up_proj
+
+flex_smooth_quant:
+  search_step: 0.1
+  use_calib_acts: false
+  # MoE post_attn_ln has 500+ expert consumers; search on a small subset
+  # (gate/shared first) then absorb the same scales into all consumers.
+  max_search_consumers: 8
+  include:
+    # Seeds; full consumers come from DeepSeekV3Adapter.build_ln_fuse_map
+    - model.layers.*.input_layernorm
+    - model.layers.*.post_attention_layernorm
+    - model.layers.*.self_attn.q_a_layernorm
+    - model.layers.*.self_attn.kv_a_layernorm
+    - model.norm
+    - model.layers.*.shared_head.norm

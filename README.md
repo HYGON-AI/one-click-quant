@@ -7,6 +7,7 @@
   - [BLOCK FP8转BF16](#block-fp8转bf16)
 - [定制化模型量化方法](#定制化模型量化方法)
 - [强制使用某个量化算法](#强制使用某个量化算法)
+- [独立预处理（QuaRot / Flex Smooth / AWQ-SSZ）](#独立预处理quarot--flex-smooth--awq-ssz)
 - [slimquant(w4a8)量化方法](#slimquant-w4a8量化方法)
 - [MoE-Quant(单机大权重gptq量化)](/utils/MoE-Quant/README.md)
 - [PPL评估](#ppl评估)
@@ -128,13 +129,43 @@ options:
                           smoothquant_awq: - SmoothQuant AWQ quantization
                           smoothquant_gptq_awq: - SmoothQuant GPTQ + AWQ quantization
                           model_free_ptq: - Data-free model-free PTQ
-                          slimquant_ptq:  - Data-free SlimQuant PTQ (W4A8) (default: None)
+                          slimquant_ptq:  - Data-free SlimQuant PTQ (W4A8)
+                          preprocess:     - Float preprocess (QuaRot / Flex Smooth / AWQ-SSZ) (default: None)
   --needs-data {true,false}
                         Override whether calibration data is required.
                         Set 'true' to force loading a dataset, 'false' to skip.
                         When not set, the default is determined by --scheme. (default: None)
 ```
 
+
+# 独立预处理（QuaRot / Flex Smooth / AWQ-SSZ）
+
+预处理与量化解耦：先写出**仍是 BF16/FP16 的 HF 目录**（权重已吸收旋转 / smooth scale），再交给任意量化路径。
+
+架构：**通用框架**（WeightStore / pipeline / absorb / transforms）+ **每模型** `adapters/<model>.py` + `recipes/<model>.yaml`。不是「一个 kimi yaml 跑通全球模型」。详见 [docs/preprocess.md](docs/preprocess.md)（以 Kimi-K3 为完整示例）。
+
+```bash
+# 1) 可选预处理（产出浮点 checkpoint；recipe 内 adapter: kimi_k3）
+python3 main.py --alg preprocess \
+  --model /path/Kimi-K3 \
+  --save-dir /path/Kimi-K3-preprocessed \
+  --recipe preprocess/recipes/kimi_k3.yaml \
+  --transforms quarot,flex_awq_ssz,flex_smooth_quant \
+  --preprocess-gpus 8
+
+# 2) 下游量化直接吃预处理目录
+python3 main.py --alg slimquant_ptq \
+  --model /path/Kimi-K3-preprocessed \
+  --scheme W4A8 \
+  --save-dir /path/Kimi-K3-W4A8 \
+  --from-preprocessed
+```
+
+`--preprocess-gpus N`：按层数据并行改权重（非 MoE EP）。单卡用默认 `1`，并可用 `--preprocess-device cuda:0`。Kimi MXFP4 会在 adapter 内先 unpack 成 BF16，再跑 QuaRot/Flex；产出体积会明显大于源 1.5T。
+
+`--from-preprocessed` 会校验输入为浮点权重且不含 `compression_config`。推荐两段式落盘，便于复用与排错。换模型时新增 adapter + recipe，勿复用 `kimi_k3.yaml`。
+
+Flex 真校准激活：样例脚本 [`preprocess/collect_acts_kimi_k3.py`](preprocess/collect_acts_kimi_k3.py) 写出 `acts.pt`，再 `--act-stats` + recipe `use_calib_acts: true`。说明见 [docs/preprocess.md](docs/preprocess.md)「采集 acts.pt」。
 
 # slimquant (w4a8)量化方法
 

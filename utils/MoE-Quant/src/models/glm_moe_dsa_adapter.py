@@ -17,13 +17,16 @@ from .base import ModelAdapter
 class GlmMoeDsaAdapter(ModelAdapter):
     """Adapter for GLM-5.3 (``model_type="glm_moe_dsa"``).
 
-    Scope of this first version: routed experts only, symmetric INT4 GPTQ,
-    channel-wise or a group_size that divides both routed-expert input dims.
-    Attention, indexer, router, shared expert, dense MLP, norms, embeddings,
-    lm_head, and the extra next-n layer 78 stay in BF16 / their source dtypes.
+    Supports symmetric INT4/INT8 GPTQ, including mixed W4A8 recipes selected
+    with --ignore and --force_int8. The legacy --quantize_only_experts flag
+    retains the routed-experts-only scope. Next-n layers bypass GPTQ and can
+    be RTN INT8-quantized with --mtp-int8 while packing. --mtp-int4 uses INT4
+    for routed MTP experts and INT8 for its other non-ignored Linears.
     """
 
     name = "glm_moe_dsa"
+    supports_mtp_int8 = True
+    supports_mtp_int4 = True
 
     _routed_expert_pattern = re.compile(
         r"(?:^|\.)mlp\.experts\.\d+\.(?:down|gate|up)_proj(?:\.|$)"
@@ -81,10 +84,10 @@ class GlmMoeDsaAdapter(ModelAdapter):
     def validate_quantization_args(self, args: Any) -> None:
         if args.bits not in (4, 8):
             raise ValueError("GLM-5.3 currently supports --bits 4 (W4A16) or --bits 8 (W8A16).")
-        if not args.quantize_only_experts:
+        if not args.quantize_only_experts and not getattr(args, "ignore", None):
             raise ValueError(
-                "GLM-5.3 currently requires --quantize_only_experts; attention/indexer/router/"
-                "shared experts stay in BF16."
+                "GLM-5.3 requires --quantize_only_experts (routed experts only) "
+                "or an explicit --ignore list for a broader GPTQ scope."
             )
         if not args.sym:
             raise ValueError("GLM-5.3 currently requires --sym (symmetric INT4/INT8 GPTQ).")
@@ -104,21 +107,30 @@ class GlmMoeDsaAdapter(ModelAdapter):
         self._validate_group_size(args)
 
     def validate_packing_args(self, args: Any) -> None:
-        if not args.quantize_only_experts:
+        if not args.quantize_only_experts and not getattr(args, "ignore", None):
             raise ValueError(
-                "GLM-5.3 currently requires an experts-only GPTQ result for packing."
+                "GLM-5.3 packing needs an experts-only GPTQ result or the "
+                "--ignore list recorded in metadata.pt."
             )
         if args.dtype != "bfloat16":
             raise ValueError("GLM-5.3 currently requires --dtype bfloat16 for packing.")
         if args.activation_bits not in (16, 8):
             raise ValueError(
-                "GLM-5.3 currently supports --activation-bits 16 (W*A16) or 8 (W8A8 only)."
+                "GLM-5.3 supports --activation-bits 16 (W*A16) or 8 (W4A8 / W8A8)."
             )
-        if args.activation_bits == 8 and args.bits != 8:
+        mtp_int8 = getattr(args, "mtp_int8", False)
+        mtp_int4 = getattr(args, "mtp_int4", False)
+        if mtp_int8 and mtp_int4:
+            raise ValueError("--mtp-int8 and --mtp-int4 are mutually exclusive.")
+        if (args.activation_bits == 8 or mtp_int8 or mtp_int4) and args.group_size is not None:
             raise ValueError(
-                "GLM-5.3 W8A8 packing requires --bits 8 GPTQ weights; W4A8 is not validated "
-                "for this adapter."
+                "GLM-5.3 W4A8 / W8A8 requires channel-wise weights; omit --group_size."
             )
+        if mtp_int8 or mtp_int4:
+            if args.quantize_only_experts:
+                raise ValueError("GLM-5.3 MTP RTN quantization requires the explicit --ignore recipe.")
+            if not self._mtp_prefixes():
+                raise ValueError("GLM-5.3 MTP RTN quantization requires num_nextn_predict_layers > 0.")
         self._validate_group_size(args)
 
     # ---------- model construction ----------
@@ -222,8 +234,44 @@ class GlmMoeDsaAdapter(ModelAdapter):
 
     # ---------- quantization scope ----------
 
+    def _mtp_prefixes(self) -> Tuple[str, ...]:
+        start = int(self.config.num_hidden_layers)
+        count = int(getattr(self.config, "num_nextn_predict_layers", 0))
+        return tuple(f"model.layers.{idx}." for idx in range(start, start + count))
+
+    def _mtp_ignore_rules(self) -> List[str]:
+        return [f"re:^{re.escape(prefix[:-1])}(?:\\..*)?$" for prefix in self._mtp_prefixes()]
+
     def default_ignore_rules(self) -> List[str]:
-        return ["lm_head"]
+        # Replayed into compressed-tensors config: structural rules must also
+        # match sglang's MTP names (model.decoder.* / model.eh_proj, etc.).
+        return [
+            "lm_head",
+            r"re:.*embed_tokens.*",
+            r"re:^model\.norm$",
+            r"re:.*(?:input_layernorm|post_attention_layernorm)$",
+            r"re:.*mlp\.gate(?:\..*)?$",
+            r"re:.*self_attn\.(?:q_a_layernorm|kv_a_layernorm)$",
+            r"re:.*self_attn\.kv_b_proj$",
+            r"re:.*self_attn\.indexer\.k_norm(?:\..*)?$",
+            r"re:.*self_attn\.indexer\.(?:weights_proj|wk_weights_proj)$",
+            r"re:.*\.(?:eh_proj|enorm|hnorm)$",
+            r"re:.*shared_head\..*",
+            *self._mtp_ignore_rules(),
+        ]
+
+    def mtp_int8_ignore(self, rules: Iterable[str]) -> List[str]:
+        blanket_rules = self._mtp_ignore_rules()
+        return [rule for rule in rules if rule not in blanket_rules]
+
+    def mtp_int4_targets(self) -> List[str]:
+        # sglang NextN registers the decoder under model.decoder.*, unlike
+        # the checkpoint's model.layers.<num_hidden_layers>.* names.
+        suffix = r"\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
+        targets = [f"re:^{re.escape(prefix[:-1])}{suffix}" for prefix in self._mtp_prefixes()]
+        if targets:
+            targets.append(r"re:^model\.decoder" + suffix)
+        return targets
 
     def legacy_ignore_rules(self) -> List[str]:
         return [
@@ -237,7 +285,6 @@ class GlmMoeDsaAdapter(ModelAdapter):
             r"re:.*_layernorm(?:\..*)?$",
             r"re:.*\.(input|post_attention)_layernorm(?:\..*)?$",
             r"re:^model\.norm(?:\..*)?$",
-            r"re:^model\.layers\.78(?:\..*)?$",
         ]
 
     # ---------- packing hooks ----------
@@ -266,7 +313,7 @@ class GlmMoeDsaAdapter(ModelAdapter):
         layer_types = list(getattr(cfg, "mlp_layer_types", []))
         names: set = set()
         for layer_idx, layer_type in enumerate(layer_types):
-            if layer_type != "sparse":
+            if layer_type != "sparse" or layer_idx >= int(cfg.num_hidden_layers):
                 continue
             prefix = f"model.layers.{layer_idx}.mlp.experts"
             for expert_idx in range(num_experts):
@@ -277,7 +324,7 @@ class GlmMoeDsaAdapter(ModelAdapter):
     def count_extra_shards(self, weight_map: Dict[str, str]) -> int:
         from . import glm_moe_dsa_utils
 
-        return glm_moe_dsa_utils.count_extra_shards(weight_map)
+        return glm_moe_dsa_utils.count_extra_shards(weight_map, self._mtp_prefixes())
 
     def save_extra_weights(
         self,
@@ -287,6 +334,9 @@ class GlmMoeDsaAdapter(ModelAdapter):
         next_shard_id: int,
         num_output_shards: int,
         safetensors_index: Dict[str, str],
+        mtp_int8_ignore: Optional[List[str]] = None,
+        mtp_pack_int8=None,
+        mtp_pack_int4=None,
     ) -> int:
         from . import glm_moe_dsa_utils
 
@@ -297,6 +347,11 @@ class GlmMoeDsaAdapter(ModelAdapter):
             next_shard_id,
             num_output_shards,
             safetensors_index,
+            mtp_prefixes=self._mtp_prefixes(),
+            mtp_int8_ignore=mtp_int8_ignore,
+            mtp_pack_int8=mtp_pack_int8,
+            mtp_pack_int4=mtp_pack_int4,
+            mtp_int4_targets=self.mtp_int4_targets(),
         )
 
     def copy_artifacts(self, source_dir: str, output_dir: str) -> None:

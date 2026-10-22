@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import gc
 import os
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -326,18 +326,26 @@ def create_glm_causal_mask(
         attention_mask=None,
         past_key_values=None,
         position_ids=position_ids,
+        # DSA's indexer reads the actual mask even when SDPA could infer
+        # causality; returning None would fail before GPTQ collects inputs.
+        allow_is_causal_skip=False,
     )
 
 
-def count_extra_shards(weight_map: Dict[str, str]) -> int:
-    """Count source shards containing the ignored next-n layer 78."""
+def count_extra_shards(
+    weight_map: Dict[str, str], mtp_prefixes: tuple[str, ...] = (_LAYER_78_PREFIX,)
+) -> int:
+    """Count source shards containing next-n tensors."""
     return len({
-        shard for key, shard in weight_map.items() if key.startswith(_LAYER_78_PREFIX)
+        shard for key, shard in weight_map.items() if key.startswith(mtp_prefixes)
     })
 
 
-def _load_extra_tensors(weight_dir: str, weight_map: Dict[str, str]) -> Iterable[tuple[str, Dict[str, torch.Tensor]]]:
-    extra_keys = {key for key in weight_map if key.startswith(_LAYER_78_PREFIX)}
+def _load_extra_tensors(
+    weight_dir: str, weight_map: Dict[str, str],
+    mtp_prefixes: tuple[str, ...] = (_LAYER_78_PREFIX,),
+) -> Iterable[tuple[str, Dict[str, torch.Tensor]]]:
+    extra_keys = {key for key in weight_map if key.startswith(mtp_prefixes)}
     for shard in sorted({weight_map[key] for key in extra_keys}):
         tensors: Dict[str, torch.Tensor] = {}
         with safe_open(os.path.join(weight_dir, shard), framework="pt", device="cpu") as handle:
@@ -355,9 +363,20 @@ def save_extra_weights(
     next_shard_id: int,
     num_output_shards: int,
     safetensors_index: Dict[str, str],
+    mtp_prefixes: tuple[str, ...] = (_LAYER_78_PREFIX,),
+    mtp_int8_ignore: Optional[List[str]] = None,
+    mtp_pack_int8: Optional[Callable[[torch.Tensor], Dict[str, torch.Tensor]]] = None,
+    mtp_pack_int4: Optional[Callable[[torch.Tensor], Dict[str, torch.Tensor]]] = None,
+    mtp_int4_targets: Optional[List[str]] = None,
 ) -> int:
-    """Copy/dequantize layer-78 next-n tensors into dedicated output shards."""
-    for source_shard, tensors in _load_extra_tensors(weight_dir, weight_map):
+    """Save next-n tensors, optionally using RTN INT4/INT8 for its Linears."""
+    from .base import ModelAdapter
+
+    if mtp_pack_int4 is not None and (mtp_pack_int8 is None or not mtp_int4_targets):
+        raise ValueError("MTP INT4 needs routed-expert targets and an INT8 packer for other Linears.")
+    num_mtp_int4 = 0
+    num_mtp_int8 = 0
+    for source_shard, tensors in _load_extra_tensors(weight_dir, weight_map, mtp_prefixes):
         packed_keys = sorted(key for key in tensors if key.endswith(".weight_packed"))
         if packed_keys:
             raise ValueError(
@@ -367,17 +386,47 @@ def save_extra_weights(
             raise RuntimeError(
                 f"GLM extra shard {source_shard} has an FP8 tensor without matching weight_scale_inv."
             )
+        mtp_packed: Dict[str, torch.Tensor] = {}
+        if mtp_pack_int8 is not None:
+            for key in sorted(tensors):
+                if not key.endswith(".weight"):
+                    continue
+                weight = tensors[key]
+                module_name = key[:-len(".weight")]
+                if weight.ndim != 2 or ModelAdapter.match_ignore(module_name, mtp_int8_ignore or []):
+                    continue
+                scale_inv = tensors.pop(f"{key}_scale_inv", None)
+                if scale_inv is not None:
+                    weight = quant_utils.dequantize_weight_from_fp8(weight.float(), scale_inv.float())
+                use_int4 = mtp_pack_int4 is not None and ModelAdapter.match_ignore(
+                    module_name, mtp_int4_targets or []
+                )
+                pack_mtp = mtp_pack_int4 if use_int4 else mtp_pack_int8
+                mtp_packed.update({
+                    f"{module_name}.{name}": value
+                    for name, value in pack_mtp(weight.float()).items()
+                })
+                del tensors[key]
+                if use_int4:
+                    num_mtp_int4 += 1
+                else:
+                    num_mtp_int8 += 1
         quant_utils.dequantize_state_dict(tensors, torch.bfloat16)
         for key, tensor in list(tensors.items()):
             if tensor.is_floating_point() and tensor.dtype not in (torch.float32, torch.bfloat16):
                 tensors[key] = tensor.to(torch.bfloat16)
+        tensors.update(mtp_packed)
         output_name = f"model-{next_shard_id:05}-of-{num_output_shards:05}.safetensors"
         save_file(tensors, os.path.join(packed_model_path, output_name))
         for key in tensors:
             safetensors_index[key] = output_name
         next_shard_id += 1
-        del tensors
+        del tensors, mtp_packed
         gc.collect()
+    if mtp_pack_int8 is not None:
+        if mtp_pack_int4 is not None:
+            print(f"[INFO] MTP RTN INT4 routed-expert weights: {num_mtp_int4}")
+        print(f"[INFO] MTP RTN INT8 Linear weights: {num_mtp_int8}")
     return next_shard_id
 
 

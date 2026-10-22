@@ -112,6 +112,7 @@ def ensure_model_params_loaded(
         weight_map,
         loaded_shards,
         include_fp8_scales=True,
+        load_only_required_tensors=getattr(adapter, "load_only_required_tensors", False),
     )
 
 
@@ -151,6 +152,7 @@ def ensure_params_loaded(
     weight_map: dict[str, str],
     loaded_shards: Optional[set[str]] = None,
     include_fp8_scales: bool = True,
+    load_only_required_tensors: bool = False,
 ) -> list[str]:
     """Load all shards needed for required_keys into param_buffer.
 
@@ -192,7 +194,16 @@ def ensure_params_loaded(
         shards_to_load.append(shard)
 
     for shard in shards_to_load:
-        param_buffer.update(load_param_shard(weight_dir, shard))
+        if load_only_required_tensors:
+            # Packed large-model sources may put unrelated blocks in a shard.
+            # Keep only requested physical weights and their source scales.
+            keys = sorted(key for key in required_key_set
+                          if weight_map[key] == shard and key not in param_buffer)
+            with safe_open(os.path.join(weight_dir, shard), framework="pt", device="cpu") as handle:
+                for key in keys:
+                    param_buffer[key] = handle.get_tensor(key)
+        else:
+            param_buffer.update(load_param_shard(weight_dir, shard))
         loaded_shards.add(shard)
 
     return shards_to_load

@@ -21,13 +21,28 @@ class Glm5NextAdapter(ModelAdapter):
     ``default_ignore_rules()`` and ``--ignore``; ``--quantize_only_experts``
     reproduces the historical routed-experts-only scope. ``group_size`` must
     divide the layer input dim and never be 32 (vLLM branches to MXFP4 there).
-    Vision tower and MTP layer 45 are carried over as bf16 extra shards.
+    Vision tower and MTP layer 45 are carried over as bf16 extra shards;
+    ``--mtp-int8`` at packing time RTN-quantizes the non-ignored MTP Linears to INT8.
+    ``--force_int8`` selects layers that GPTQ quantizes to INT8 regardless of ``--bits``.
     """
 
     name = "glm5_next"
+    supports_mtp_int8 = True
 
     _routed_expert_pattern = re.compile(
         r"(?:^|\.)mlp\.experts\.\d+\.(?:down|gate|up)_proj(?:\.|$)"
+    )
+
+    # DSA indexer: wq_b/wk stay bf16 by default (FP8_DYNAMIC reference recipe)
+    # but are released when --force_int8 claims them (W4A8 iter_0033200 recipe);
+    # weights_proj / k_norm / kpool parameters always stay bf16.
+    _INDEXER_BF16_IGNORE = r"re:.*\.self_attn\.indexer\.(?!(?:wq_b|wk)$).*$"
+    _INDEXER_LINEAR_IGNORE = r"re:.*\.self_attn\.indexer\.(?:wq_b|wk)$"
+    # Blanket MTP rules; dropped from the packed ignore when layer 45 is RTN INT8.
+    _MTP_IGNORE_RULES = (
+        r"re:.*layers\.45(?:\..*)?$",
+        r"re:.*\.layers\.45(?:\..*)?$",
+        r"re:^model\.layers\.45(?:\..*)?$",
     )
 
     # GLM-5.3-Flash checkpoints on disk use flat pre-nesting names
@@ -187,14 +202,14 @@ class Glm5NextAdapter(ModelAdapter):
         if args.activation_bits not in (16, 8):
             raise ValueError(
                 "GLM-5.3-Flash currently supports --activation-bits 16 (W*A16) or "
-                "8 (W8A8Int8 only)."
-            )
-        if args.activation_bits == 8 and args.bits != 8:
-            raise ValueError(
-                "GLM-5.3-Flash W8A8 packing requires --bits 8 GPTQ weights; W4A8 is not "
-                "validated for this adapter."
+                "8 (W8A8 / W4A8 Int8)."
             )
         self._validate_group_size(args)
+        if getattr(args, "mtp_int8", False) and args.quantize_only_experts:
+            raise ValueError(
+                "GLM-5.3-Flash --mtp-int8 needs the explicit --ignore recipe; the "
+                "legacy --quantize_only_experts scope keeps MTP layer 45 in bf16."
+            )
 
     # ------------------------------------------------------------------ #
     # Model construction                                                 #
@@ -467,9 +482,39 @@ class Glm5NextAdapter(ModelAdapter):
             r"re:.*(?:hc_(?:attn|ffn)_(?:base|fn|scale)|(?:attn|ffn)_hc\.(?:base|fn|scale))$",
             # Router: vLLM's GateLinear hard-codes quant_config=None.
             r"re:.*\.mlp\.gate(?:\..*)?$",
-            # DSA indexer stays bf16, matching the FP8_DYNAMIC reference recipe.
-            r"re:.*\.self_attn\.indexer\..*$",
+            # DSA indexer stays bf16, matching the FP8_DYNAMIC reference recipe;
+            # wq_b/wk can be released by --force_int8 (see resolve_ignore).
+            self._INDEXER_BF16_IGNORE,
+            self._INDEXER_LINEAR_IGNORE,
         ]
+
+    def _indexer_linear_names(self) -> List[str]:
+        text_config = self._text_config()
+        layer_types = list(getattr(text_config, "layer_types", []) or [])
+        names: List[str] = []
+        for layer_idx, layer_type in enumerate(layer_types):
+            if layer_type == "linear_attention":
+                continue
+            prefix = f"{self.get_layer_prefix(layer_idx)}self_attn.indexer."
+            names.extend(f"{prefix}{proj}" for proj in ("wq_b", "wk"))
+        return names
+
+    def resolve_ignore(
+        self,
+        ignore: Optional[Iterable[str]] = None,
+        quantize_only_experts: bool = False,
+        force_int8: Optional[Iterable[str]] = None,
+    ) -> List[str]:
+        rules = super().resolve_ignore(ignore, quantize_only_experts)
+        force_int8 = list(force_int8 or [])
+        if force_int8 and any(
+            self.match_ignore(name, force_int8) for name in self._indexer_linear_names()
+        ):
+            rules.remove(self._INDEXER_LINEAR_IGNORE)
+        return rules
+
+    def mtp_int8_ignore(self, rules: Iterable[str]) -> List[str]:
+        return [rule for rule in rules if rule not in self._MTP_IGNORE_RULES]
 
     def legacy_ignore_rules(self) -> List[str]:
         return [
@@ -569,6 +614,8 @@ class Glm5NextAdapter(ModelAdapter):
         next_shard_id: int,
         num_output_shards: int,
         safetensors_index: Dict[str, str],
+        mtp_int8_ignore: Optional[List[str]] = None,
+        mtp_pack_int8=None,
     ) -> int:
         from . import glm5_next_utils
 
@@ -579,6 +626,8 @@ class Glm5NextAdapter(ModelAdapter):
             next_shard_id,
             num_output_shards,
             safetensors_index,
+            mtp_int8_ignore=mtp_int8_ignore,
+            mtp_pack_int8=mtp_pack_int8,
         )
 
     def copy_artifacts(self, source_dir: str, output_dir: str) -> None:
