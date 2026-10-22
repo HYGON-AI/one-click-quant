@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from argparse import ArgumentParser
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from glob import glob
 
 import torch
@@ -74,6 +74,16 @@ def out_scale_name_for(weight_name: str) -> str:
     return ".".join(weight_name.split(".")[:-1] + ["weight_scale_inv"])
 
 
+# FP4_TABLE 按 device 缓存一份,避免每次查表都搬运
+_FP4_TABLE_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _fp4_table_on(device: torch.device) -> torch.Tensor:
+    if device not in _FP4_TABLE_CACHE:
+        _FP4_TABLE_CACHE[device] = FP4_TABLE.to(device)
+    return _FP4_TABLE_CACHE[device]
+
+
 def unpack_e2m1fn_to_float(x: torch.Tensor) -> torch.Tensor:
     """
     Unpack FP4 E2M1FN packed tensor (int8) to float32.
@@ -83,7 +93,8 @@ def unpack_e2m1fn_to_float(x: torch.Tensor) -> torch.Tensor:
     x = x.view(torch.uint8)
     low = x & 0x0F
     high = (x >> 4) & 0x0F
-    return torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(1)
+    table = _fp4_table_on(x.device)
+    return torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(1)
 
 
 def dequant_fp4_to_float(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -201,8 +212,18 @@ def is_fp8_blockwise_weight(name: str, tensor: torch.Tensor, state_dict: dict) -
 
 
 def is_wo_a_weight(name: str) -> bool:
-    """wo_a 权重不量化（保持 BF16）"""
+    """wo_a 权重（默认反量化为 BF16，--quantize-wo-a 时量化为 FP8 channelwise）"""
     return name.endswith("wo_a.weight") or name.endswith("attn.o_a_proj.weight")
+
+
+def is_markov_head_weight(name: str) -> bool:
+    """mtp.N.markov_head.head.weight（默认保持 BF16，--quantize-markov-head 时量化为 FP8 channelwise）"""
+    return name.endswith(".markov_head.head.weight")
+
+
+def is_lm_head_weight(name: str) -> bool:
+    """顶层 head.weight (sglang 的 lm_head,默认保持 BF16,--quantize-lm-head 时量化为 FP8 channelwise)"""
+    return name == "head.weight"
 
 
 def has_scale(name: str, state_dict: dict[str, torch.Tensor]) -> bool:
@@ -210,12 +231,40 @@ def has_scale(name: str, state_dict: dict[str, torch.Tensor]) -> bool:
     return scale_name_for(name) in state_dict
 
 
-def convert_one_file(input_path: str, output_path: str, engram_wkv_mode: str = "channel") -> None:
+def convert_one_file(
+    input_path: str,
+    output_path: str,
+    engram_wkv_mode: str = "channel",
+    quantize_wo_a: bool = False,
+    quantize_markov_head: bool = False,
+    quantize_lm_head: bool = False,
+    device: torch.device | str = "cpu",
+) -> None:
     """转换单个 safetensors 文件
 
     Args:
         engram_wkv_mode: engram.wkv 的处理模式 (channel/bf16/blockwise)
+        quantize_wo_a: 把 attn.wo_a 量化为 FP8 channelwise (默认反量化为 BF16)
+        quantize_markov_head: 把 markov_head.head 量化为 FP8 channelwise (默认保持 BF16)
+        quantize_lm_head: 把顶层 head.weight (lm_head) 量化为 FP8 channelwise (默认保持 BF16)
+        device: 计算所在 device (cpu 或 cuda:N)。张量从 safetensors 读到 CPU,
+            逐个搬到 device 上做反量化/量化,保存前搬回 CPU (save_file 要求 CPU 张量)。
     """
+    device = torch.device(device)
+
+    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+        return t if t.device == device else t.to(device)
+
+    def _to_cpu(t: torch.Tensor) -> torch.Tensor:
+        return t if t.device.type == "cpu" else t.cpu()
+
+    def _scale_to_dev(t: torch.Tensor) -> torch.Tensor:
+        # float8_e8m0fnu 先在 CPU 转 float32 再搬运,避免 CUDA 对该 dtype 的拷贝/转换支持因 torch 版本而异
+        return t.float().to(device)
+
+    def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return dequant_fp8_blockwise(_to_dev(weight), _scale_to_dev(scale))
+
     state_dict = {}
     with safe_open(input_path, framework="pt", device="cpu") as f:
         for name in f.keys():
@@ -250,8 +299,8 @@ def convert_one_file(input_path: str, output_path: str, engram_wkv_mode: str = "
                 # 反量化为 BF16 (不输出 scale)
                 if has_scale(name, state_dict):
                     scale = state_dict[scale_name]
-                    weight_bf16 = dequant_fp8_blockwise(tensor, scale).bfloat16()
-                    new_state_dict[name] = weight_bf16
+                    weight_bf16 = _dequant_fp8(tensor, scale).bfloat16()
+                    new_state_dict[name] = _to_cpu(weight_bf16)
                 else:
                     new_state_dict[name] = tensor
                 continue
@@ -261,18 +310,26 @@ def convert_one_file(input_path: str, output_path: str, engram_wkv_mode: str = "
         if is_fp4_expert(name, tensor):
             scale = state_dict[scale_name]
             # 反量化为 float32
-            weight_fp32 = dequant_fp4_to_float(tensor, scale)
+            weight_fp32 = dequant_fp4_to_float(_to_dev(tensor), _scale_to_dev(scale))
             # 重新量化为 FP8 channelwise
             weight_fp8, new_scale = quantize_fp8_channelwise(weight_fp32)
-            new_state_dict[name] = weight_fp8
-            new_state_dict[out_scale_name] = new_scale
+            new_state_dict[name] = _to_cpu(weight_fp8)
+            new_state_dict[out_scale_name] = _to_cpu(new_scale)
 
-        # 2. wo_a 权重：反量化为 BF16（不重新量化）
+        # 2. wo_a 权重：默认反量化为 BF16；quantize_wo_a 时重新量化为 FP8 channelwise
         elif is_wo_a_weight(name):
-            if has_scale(name, state_dict):
+            if quantize_wo_a and tensor.ndim == 2:
+                if has_scale(name, state_dict):
+                    weight_fp32 = _dequant_fp8(tensor, state_dict[scale_name])
+                else:
+                    weight_fp32 = _to_dev(tensor).float()
+                weight_fp8, new_scale = quantize_fp8_channelwise(weight_fp32)
+                new_state_dict[name] = _to_cpu(weight_fp8)
+                new_state_dict[out_scale_name] = _to_cpu(new_scale)
+            elif has_scale(name, state_dict):
                 scale = state_dict[scale_name]
-                weight_bf16 = dequant_fp8_blockwise(tensor, scale).bfloat16()
-                new_state_dict[name] = weight_bf16
+                weight_bf16 = _dequant_fp8(tensor, scale).bfloat16()
+                new_state_dict[name] = _to_cpu(weight_bf16)
             else:
                 new_state_dict[name] = tensor
 
@@ -298,11 +355,33 @@ def convert_one_file(input_path: str, output_path: str, engram_wkv_mode: str = "
                 new_state_dict[out_scale_name] = scale
                 continue
             # 反量化为 float32
-            weight_fp32 = dequant_fp8_blockwise(tensor, scale)
+            weight_fp32 = _dequant_fp8(tensor, scale)
             # 重新量化为 FP8 channelwise
             weight_fp8, new_scale = quantize_fp8_channelwise(weight_fp32)
-            new_state_dict[name] = weight_fp8
-            new_state_dict[out_scale_name] = new_scale
+            new_state_dict[name] = _to_cpu(weight_fp8)
+            new_state_dict[out_scale_name] = _to_cpu(new_scale)
+
+        # 3b. markov_head.head: BF16 无 scale，quantize_markov_head 时量化为 FP8 channelwise
+        elif (
+            quantize_markov_head
+            and is_markov_head_weight(name)
+            and tensor.ndim == 2
+            and tensor.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            weight_fp8, new_scale = quantize_fp8_channelwise(_to_dev(tensor).float())
+            new_state_dict[name] = _to_cpu(weight_fp8)
+            new_state_dict[out_scale_name] = _to_cpu(new_scale)
+
+        # 3c. lm_head (顶层 head.weight): BF16 无 scale，quantize_lm_head 时量化为 FP8 channelwise
+        elif (
+            quantize_lm_head
+            and is_lm_head_weight(name)
+            and tensor.ndim == 2
+            and tensor.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            weight_fp8, new_scale = quantize_fp8_channelwise(_to_dev(tensor).float())
+            new_state_dict[name] = _to_cpu(weight_fp8)
+            new_state_dict[out_scale_name] = _to_cpu(new_scale)
 
         # 4. 其他权重：直接复制
         else:
@@ -311,13 +390,89 @@ def convert_one_file(input_path: str, output_path: str, engram_wkv_mode: str = "
     save_file(new_state_dict, output_path)
 
 
-def convert_model(input_dir: str, output_dir: str, engram_wkv_mode: str = "channel") -> None:
-    """转换整个模型"""
+def _resolve_devices(
+    device_kind: str,
+    gpu_ids: str | None,
+    workers: int | None,
+    num_files: int,
+) -> tuple[list[torch.device], int]:
+    """解析 --device / --gpu-ids / --workers,返回 (devices, effective_workers)。
+
+    effective_workers == 1 表示主进程顺序执行,>1 表示每个 worker 绑定一张 GPU 的多进程池。
+    """
+    cuda_available = torch.cuda.is_available()
+    if device_kind == "cpu":
+        return [torch.device("cpu")], 1
+    if device_kind == "cuda" and not cuda_available:
+        raise RuntimeError("--device cuda specified but torch.cuda.is_available() == False")
+    if device_kind == "auto" and not cuda_available:
+        return [torch.device("cpu")], 1
+
+    if gpu_ids:
+        try:
+            ids = [int(x.strip()) for x in gpu_ids.split(",") if x.strip()]
+        except ValueError as e:
+            raise RuntimeError(f"invalid --gpu-ids {gpu_ids!r}: {e}") from e
+    else:
+        ids = list(range(torch.cuda.device_count()))
+    if not ids:
+        raise RuntimeError("no CUDA device selected (device_count == 0)")
+
+    devices = [torch.device(f"cuda:{i}") for i in ids]
+    requested = len(devices) if workers is None else max(1, workers)
+    return devices, min(requested, max(1, num_files))
+
+
+def _worker_convert_shard(args: tuple) -> None:
+    """spawn worker 入口: 绑定一张 GPU,处理一个 shard。必须是模块顶层函数以支持 pickle。"""
+    input_path, output_path, flags, gpu_id, num_threads = args
+    torch.set_num_threads(max(1, num_threads))
+    torch.cuda.set_device(gpu_id)
+    convert_one_file(input_path, output_path, *flags, torch.device(f"cuda:{gpu_id}"))
+
+
+def convert_model(
+    input_dir: str,
+    output_dir: str,
+    engram_wkv_mode: str = "channel",
+    quantize_wo_a: bool = False,
+    quantize_markov_head: bool = False,
+    quantize_lm_head: bool = False,
+    device_kind: str = "cpu",
+    gpu_ids: str | None = None,
+    workers: int | None = None,
+    num_threads: int = 8,
+) -> None:
+    """转换整个模型: CPU/单卡顺序执行,多卡时每卡一个 worker 并行处理 shard"""
     os.makedirs(output_dir, exist_ok=True)
     files = sorted(glob(os.path.join(input_dir, "*.safetensors")))
-    for path in tqdm(files, desc="Converting"):
-        fname = os.path.basename(path)
-        convert_one_file(path, os.path.join(output_dir, fname), engram_wkv_mode)
+    devices, effective_workers = _resolve_devices(device_kind, gpu_ids, workers, len(files))
+    flags = (engram_wkv_mode, quantize_wo_a, quantize_markov_head, quantize_lm_head)
+
+    if effective_workers <= 1 or len(devices) == 1:
+        device = devices[0]
+        for path in tqdm(files, desc=f"Converting on {device}"):
+            convert_one_file(
+                path, os.path.join(output_dir, os.path.basename(path)), *flags, device
+            )
+        return
+
+    import torch.multiprocessing as mp
+
+    tasks = [
+        (
+            path,
+            os.path.join(output_dir, os.path.basename(path)),
+            flags,
+            int(devices[i % len(devices)].index),
+            num_threads,
+        )
+        for i, path in enumerate(files)
+    ]
+    desc = f"Converting on {len(devices)} GPU(s) ({effective_workers} workers)"
+    with mp.get_context("spawn").Pool(processes=effective_workers) as pool:
+        for _ in tqdm(pool.imap_unordered(_worker_convert_shard, tasks), total=len(tasks), desc=desc):
+            pass
 
 
 def fp8_compression_config() -> dict:
@@ -330,8 +485,14 @@ def fp8_compression_config() -> dict:
     }
 
 
-def update_index(output_dir: str, engram_wkv_mode: str = "channel") -> None:
-    """更新 model.safetensors.index.json,移除反量化为 BF16 的层的 weight_scale_inv"""
+def update_index(
+    output_dir: str,
+    engram_wkv_mode: str = "channel",
+    quantize_wo_a: bool = False,
+    quantize_markov_head: bool = False,
+    quantize_lm_head: bool = False,
+) -> None:
+    """更新 model.safetensors.index.json,移除反量化为 BF16 的层的 scale,并按实际分片重算 total_size"""
     index_path = os.path.join(output_dir, "model.safetensors.index.json")
     if not os.path.exists(index_path):
         return
@@ -340,27 +501,69 @@ def update_index(output_dir: str, engram_wkv_mode: str = "channel") -> None:
         model_index = json.load(f)
 
     # 移除反量化为 BF16 的层 (wo_a / o_a_proj, 以及 engram.wkv 在 bf16 模式) 的 scale
+    # 源索引里的键名是 ".scale",输出索引可能是 ".weight_scale_inv",两种都要处理
     def should_remove_scale(name: str) -> bool:
-        if not name.endswith(".weight_scale_inv"):
+        if name.endswith(".weight_scale_inv"):
+            weight_name = name[: -len(".weight_scale_inv")] + ".weight"
+        elif name.endswith(".scale"):
+            weight_name = name[: -len(".scale")] + ".weight"
+        else:
             return False
-        weight_name = name.replace(".weight_scale_inv", ".weight")
         if weight_name.endswith("wo_a.weight") or weight_name.endswith("o_a_proj.weight"):
-            return True
+            return not quantize_wo_a
         if engram_wkv_mode == "bf16" and ".engram.wkv." in weight_name:
             return True
         return False
-    
-    model_index["weight_map"] = {
-        name: fname
+
+    # quantize_wo_a 时 wo_a 的 scale 在分片里已改名为 weight_scale_inv,索引同步改名
+    def renamed(name: str) -> str:
+        if quantize_wo_a and name.endswith(".scale"):
+            weight_name = name[: -len(".scale")] + ".weight"
+            if weight_name.endswith("wo_a.weight") or weight_name.endswith("o_a_proj.weight"):
+                return name[: -len(".scale")] + ".weight_scale_inv"
+        return name
+
+    weight_map = {
+        renamed(name): fname
         for name, fname in model_index["weight_map"].items()
         if not should_remove_scale(name)
     }
+    # markov_head.head 原本没有 scale,量化后新增 weight_scale_inv,与 weight 同分片
+    if quantize_markov_head:
+        for name, fname in list(weight_map.items()):
+            if name.endswith(".markov_head.head.weight"):
+                weight_map[out_scale_name_for(name)] = fname
+    # lm_head (顶层 head.weight) 同理
+    if quantize_lm_head and "head.weight" in weight_map:
+        weight_map[out_scale_name_for("head.weight")] = weight_map["head.weight"]
+    model_index["weight_map"] = weight_map
+
+    total_size = 0
+    for fname in set(model_index["weight_map"].values()):
+        shard_path = os.path.join(output_dir, fname)
+        if not os.path.exists(shard_path):
+            break
+        with open(shard_path, "rb") as sf:
+            header_len = int.from_bytes(sf.read(8), "little")
+            header = json.loads(sf.read(header_len))
+        for key, meta in header.items():
+            if key != "__metadata__":
+                total_size += meta["data_offsets"][1] - meta["data_offsets"][0]
+    else:
+        model_index.setdefault("metadata", {})["total_size"] = total_size
 
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
 
 
-def copy_metadata(input_dir: str, output_dir: str, engram_wkv_mode: str = "channel") -> None:
+def copy_metadata(
+    input_dir: str,
+    output_dir: str,
+    engram_wkv_mode: str = "channel",
+    quantize_wo_a: bool = False,
+    quantize_markov_head: bool = False,
+    quantize_lm_head: bool = False,
+) -> None:
     """复制配置文件并更新 quantization_config"""
     for fname in [
         "config.json",
@@ -374,7 +577,7 @@ def copy_metadata(input_dir: str, output_dir: str, engram_wkv_mode: str = "chann
         if os.path.exists(src):
             shutil.copyfile(src, os.path.join(output_dir, fname))
 
-    update_index(output_dir, engram_wkv_mode)
+    update_index(output_dir, engram_wkv_mode, quantize_wo_a, quantize_markov_head, quantize_lm_head)
 
     config_path = os.path.join(output_dir, "config.json")
     if not os.path.exists(config_path):
@@ -399,7 +602,8 @@ def copy_metadata(input_dir: str, output_dir: str, engram_wkv_mode: str = "chann
 
 def main() -> None:
     parser = ArgumentParser(
-        description="Convert DeepSeek-V4.1-Flash to FP8 channelwise format."
+        description="Convert DeepSeek-V4.1-Flash to FP8 channelwise format.",
+        formatter_class=ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--input-dir",
@@ -429,6 +633,46 @@ def main() -> None:
              "bf16=反量化为 BF16 (最高精度,+314MB); "
              "blockwise=保留原始 FP8 blockwise (可能支持 MXFP8 优化)",
     )
+    parser.add_argument(
+        "--quantize-wo-a",
+        action="store_true",
+        help="把 attn.wo_a 量化为 FP8 channelwise (默认关闭,保持 BF16)。"
+             "注意: 推理引擎需支持该层的 FP8 channelwise 权重,否则加载会失败。",
+    )
+    parser.add_argument(
+        "--quantize-markov-head",
+        action="store_true",
+        help="把 mtp.*.markov_head.head 量化为 FP8 channelwise (默认关闭,保持 BF16)。"
+             "注意: 推理引擎需支持该层的 FP8 权重,否则加载会失败。",
+    )
+    parser.add_argument(
+        "--quantize-lm-head",
+        action="store_true",
+        help="把顶层 head.weight (lm_head) 量化为 FP8 channelwise (默认关闭,保持 BF16)。"
+             "注意: 输出层量化误差直接影响 logits,且推理引擎需支持 lm_head 的 FP8 权重 "
+             "(DSpark 草稿模型也复用该权重),否则加载或精度会出问题。",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cpu", "cuda"],
+        default="cpu",
+        help="计算设备: cpu (默认), cuda (需要 GPU,不可用则报错), "
+             "auto (有 GPU 用 GPU,否则 CPU)。",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="使用的 CUDA 设备编号,逗号分隔,如 '0,1,3'。默认使用全部可见 GPU。",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="多卡并行的 worker 进程数,默认 min(GPU 数, 分片数)。CPU / 单卡模式忽略。"
+             "每个 worker 会把整个分片读入内存,注意主机内存占用。",
+    )
     args = parser.parse_args()
 
     torch.set_num_threads(args.num_threads)
@@ -436,9 +680,31 @@ def main() -> None:
     print(f"Converting {args.input_dir} to FP8 channelwise format...")
     print(f"Output directory: {args.output_dir}")
     print(f"engram.wkv mode: {args.engram_wkv_mode}")
+    print(f"quantize wo_a: {args.quantize_wo_a}")
+    print(f"quantize markov_head.head: {args.quantize_markov_head}")
+    print(f"quantize lm_head (head.weight): {args.quantize_lm_head}")
+    print(f"device: {args.device}")
 
-    convert_model(args.input_dir, args.output_dir, args.engram_wkv_mode)
-    copy_metadata(args.input_dir, args.output_dir, args.engram_wkv_mode)
+    convert_model(
+        args.input_dir,
+        args.output_dir,
+        args.engram_wkv_mode,
+        args.quantize_wo_a,
+        args.quantize_markov_head,
+        args.quantize_lm_head,
+        args.device,
+        args.gpu_ids,
+        args.workers,
+        args.num_threads,
+    )
+    copy_metadata(
+        args.input_dir,
+        args.output_dir,
+        args.engram_wkv_mode,
+        args.quantize_wo_a,
+        args.quantize_markov_head,
+        args.quantize_lm_head,
+    )
 
     print(f"\nDone! Converted FP8 channelwise model saved to {args.output_dir}")
 
