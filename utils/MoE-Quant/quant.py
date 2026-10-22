@@ -342,20 +342,25 @@ def release(block, prefix, checkpoint, runtime):
     gc.collect()
 
 
-def save_quantization_metadata(args, ignore_rules):
-    if args.save_dir:
-        torch.save(
-            {
-                "bits": args.bits,
-                "group_size": args.group_size,
-                # Fully resolved; the packer replays this into quantization_config.ignore.
-                "ignore": list(ignore_rules),
-                # Layers matching these patterns were GPTQ-quantized to INT8.
-                "force_int8": list(args.force_int8 or []),
-                "quantize_only_experts": args.quantize_only_experts,
-            },
-            os.path.join(args.save_dir, "metadata.pt"),
-        )
+def save_quantization_metadata(args, ignore_rules, adapter=None):
+    if args.save_dir and dist_utils.is_main():
+        metadata = {
+            "bits": args.bits,
+            "group_size": args.group_size,
+            "sym": args.sym,
+            "complete": True,
+            # Fully resolved; the packer replays this into quantization_config.ignore.
+            "ignore": list(ignore_rules),
+            # Layers matching these patterns were GPTQ-quantized to INT8.
+            "force_int8": list(args.force_int8 or []),
+            "quantize_only_experts": args.quantize_only_experts,
+        }
+        if adapter is not None:
+            metadata.update(adapter.quantization_metadata())
+        os.makedirs(args.save_dir, exist_ok=True)
+        temporary_path = os.path.join(args.save_dir, "metadata.pt.tmp")
+        torch.save(metadata, temporary_path)
+        os.replace(temporary_path, os.path.join(args.save_dir, "metadata.pt"))
 
 
 def cleanup_runtime():
@@ -686,7 +691,8 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
         release(block, prefix, checkpoint, runtime)
 
-    save_quantization_metadata(args, ignore_rules)
+    dist_utils.barrier(device_ids=[rank])
+    save_quantization_metadata(args, ignore_rules, adapter)
     cleanup_runtime()
 
 

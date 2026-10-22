@@ -9,11 +9,13 @@ from .deepseek_v3_adapter import DeepSeekV3Adapter
 from .glm5_next_adapter import Glm5NextAdapter
 from .glm_moe_dsa_adapter import GlmMoeDsaAdapter
 from .kimi_k3_adapter import KimiK3Adapter
+from .mimo_v2_adapter import MiMoV2Adapter
 from .qwen3_5_moe_adapter import Qwen35MoeAdapter
 
 
 # More specific adapters must appear before less specific adapters.
 _ADAPTER_CLASSES: List[Type[ModelAdapter]] = [
+    MiMoV2Adapter,
     KimiK3Adapter,
     Glm5NextAdapter,
     GlmMoeDsaAdapter,
@@ -34,7 +36,7 @@ def get_model_adapter(config: Any) -> ModelAdapter:
         f"architectures={getattr(config, 'architectures', None)!r}. "
         "MoE-Quant currently supports DeepSeek-V3-style models, "
         "Qwen3.5/Qwen3.8 MoE text models, GLM-5.3 (glm_moe_dsa), "
-        "GLM-5.3-Flash (glm5_next), and Kimi-K3."
+        "GLM-5.3-Flash (glm5_next), Kimi-K3, and MiMo-V2 (mimo_v2)."
     )
 
 
@@ -44,6 +46,7 @@ __all__ = [
     "Glm5NextAdapter",
     "GlmMoeDsaAdapter",
     "KimiK3Adapter",
+    "MiMoV2Adapter",
     "Qwen35MoeAdapter",
     "get_model_adapter",
 ]
