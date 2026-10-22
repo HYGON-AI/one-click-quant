@@ -48,3 +48,20 @@ python3 examples/deepseek/quantize_deepseek_v4_1_flash_mixed_int4_int8.py \
 
 ```
 
+### DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8
+
+```bash
+cd one-click-quant
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash-1017 \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8 \
+  --num-threads 32
+
+# OR
+
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash-1017 \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8 \
+  --num-threads 32 --quantize-wo-a --quantize-markov-head --quantize-lm-head
+```
+
