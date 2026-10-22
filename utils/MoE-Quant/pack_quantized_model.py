@@ -57,6 +57,14 @@ def parse_args():
         default=16,
         help="Activation precision declared in quantization_config; 16 keeps weight-only W*A16, 8 declares dynamic per-token INT8 activations (W8A8 / W4A8).",
     )
+    parser.add_argument(
+        "--rtn-device", default="auto",
+        help="MiMo old MTP RTN device: auto uses cuda:0 when available, otherwise cpu.",
+    )
+    parser.add_argument(
+        "--max-shard-size-mb", type=int, default=4096,
+        help="Maximum pending output shard size in MiMo's streaming exporter (MiB).",
+    )
     mtp_group = parser.add_mutually_exclusive_group()
     mtp_group.add_argument(
         "--mtp-int8",
@@ -65,7 +73,8 @@ def parse_args():
         help=(
             "RTN-quantize the non-ignored Linears of the MTP layer (which bypasses "
             "GPTQ) to INT8 channel-wise instead of copying them as bf16. Only for "
-            "adapters that support it (GLM-5.3 / GLM-5.3-Flash)."
+            "adapters that support it (GLM-5.3 / GLM-5.3-Flash / MiMo-V2). "
+            "MiMo preserves source BF16/FP32 MTP tensors and uses its reference RTN decoder."
         ),
     )
     mtp_group.add_argument(
@@ -400,15 +409,9 @@ def main():
         raise ValueError(f"--mtp-int4 is not supported by the {adapter.name} adapter.")
     adapter.prepare_config(config, world_size=1)
 
-    with init_empty_weights():
-        model = adapter.build_packing_model(config, torch.bfloat16).eval()
-        model.config.use_cache = False
-        adapter.prepare_model(model, config, torch.bfloat16)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-
     # Load quantization metadata
-    metadata = torch.load(os.path.join(args.quantized_model_path, "metadata.pt"))
+    metadata = torch.load(os.path.join(args.quantized_model_path, "metadata.pt"),
+                          map_location="cpu", weights_only=True)
     args.bits = metadata["bits"]
     args.group_size = metadata["group_size"]
     args.quantize_only_experts = metadata.get("quantize_only_experts", False)
@@ -416,13 +419,28 @@ def main():
     args.force_int8 = metadata.get("force_int8") or []
     # Currently we do not support asymmetric quantization
     args.sym = True
+    if not metadata.get("sym", True):
+        raise ValueError("Packing asymmetric GPTQ results is not supported.")
     adapter.validate_packing_args(args)
+    adapter.validate_quantization_metadata(metadata)
     if args.mtp_int8 and not adapter.supports_mtp_int8:
         raise ValueError(f"--mtp-int8 is not supported by the {adapter.name} adapter.")
     print(
         f"[INFO] default bits={args.bits}, force_int8={args.force_int8}, "
         f"mtp_int8={args.mtp_int8}, mtp_int4={args.mtp_int4}"
     )
+
+    # Some source layouts need per-tensor export, including weights absent from
+    # the calibration graph. Let their adapters stream directly without building
+    # a second enormous structural model or altering ordinary adapters.
+    if adapter.pack_checkpoint(args, metadata):
+        return
+
+    with init_empty_weights():
+        model = adapter.build_packing_model(config, torch.bfloat16).eval()
+        model.config.use_cache = False
+        adapter.prepare_model(model, config, torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
     # Resolve input weights through the HuggingFace safetensors index instead of
     # assuming DeepSeek's model-xxxxx-of-000163 naming convention.

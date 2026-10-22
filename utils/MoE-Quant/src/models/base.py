@@ -21,6 +21,7 @@ class ModelAdapter:
     """
 
     name = "default"
+    load_only_required_tensors = False
     # Whether save_extra_weights() accepts ``mtp_int8_ignore``/``mtp_pack_int8``
     # (RTN INT8 for an MTP layer that bypasses GPTQ).
     supports_mtp_int8 = False
@@ -93,6 +94,19 @@ class ModelAdapter:
     def validate_packing_args(self, args: Any) -> None:
         """Validate model-specific packed-checkpoint options."""
         del args
+
+    def quantization_metadata(self) -> Dict[str, Any]:
+        """Additional source provenance recorded with completed GPTQ results."""
+        return {}
+
+    def validate_quantization_metadata(self, metadata: Dict[str, Any]) -> None:
+        """Check adapter-specific provenance before consuming GPTQ results."""
+        del metadata
+
+    def pack_checkpoint(self, args: Any, metadata: Dict[str, Any]) -> bool:
+        """Return True after handling a model-specific streaming export."""
+        del args, metadata
+        return False
 
     def build_empty_model(
         self,

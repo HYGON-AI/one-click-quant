@@ -127,18 +127,30 @@ class GPTQ:
         Preparatory step with hessian regularization and weight reshaping.
         """
         # 1) Hessian preparation
-        reduce_if_needed = True
-        if self.H is None:
-            if self.tied_gptq_handle:
-                self.H = self.tied_gptq_handle.H
+        if self.H is None and self.tied_gptq_handle:
+            # The source handle has already reduced and regularized this Hessian.
+            self.H = self.tied_gptq_handle.H
+        elif self.is_distributed and dist_utils.is_dist_available_and_initialized():
+            # update() stores 2*X.T@X / local_token_count. Calibration sequences
+            # vary in length, so averaging ranks would weight short ranks too
+            # heavily. Pool token-weighted sufficient statistics instead. Every
+            # rank must participate, including one with no local observations.
+            if self.H is None:
+                self.H = torch.zeros((self.d_col, self.d_col), device=self.W_device,
+                                     dtype=torch.float32)
+            self.H.mul_(self.num_samples)
+            sample_count = torch.tensor(float(self.num_samples), device=self.W_device,
+                                        dtype=torch.float64)
+            dist.all_reduce(self.H, op=dist.ReduceOp.SUM)
+            dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
+            if sample_count.item() > 0:
+                self.H.div_(sample_count)
             else:
                 self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
                 self.issue_zero_samples = True
-            # No need to reduce
-            reduce_if_needed = False
-        # synchronize Hessians
-        if self.is_distributed and reduce_if_needed and dist_utils.is_dist_available_and_initialized():
-            dist.all_reduce(self.H, op=dist.ReduceOp.AVG)
+        elif self.H is None:
+            self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
+            self.issue_zero_samples = True
         # Replace matrix by identity in case of NaNs
         if torch.isnan(self.H).any().item():
             self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
@@ -249,7 +261,8 @@ class GPTQ:
         try:
             H = linalg_utils.inv_sym(H)
             H_inv_cho = torch.linalg.cholesky(H, upper=True)
-        except:
+        except (RuntimeError, torch.linalg.LinAlgError):
+            self.issue_non_invertible = True
             H_inv_cho = torch.eye(self.d_col, device=H.device, dtype=torch.float32)
         # Divide Hessian inverse by diagonal (in order to not divide on it later)
         H_inv_cho.div_(H_inv_cho.diag()[:, None])

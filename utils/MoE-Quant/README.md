@@ -146,8 +146,13 @@ python pack_quantized_model.py \
 - Kimi-K3 (KimiK3ForConditionalGeneration)
 - GLM-5.3 (GlmMoeDsaForCausalLM)
 - GLM-5.3-Flash (Glm5NextForConditionalGeneration)
+- MiMo-V2.6-Flash-RL (MiMoV2ForCausalLM)：源 MXFP4→channel INT4 GPTQ、FP8→channel INT8 GPTQ、BF16/FP32 保留；旧 MTP 沿用 RTN。
 
-> 多模态包装类只量化文本主干；视觉塔 (`model.visual.*`) 与 MTP 头 (`mtp.*`)
+MiMo 的完整适配、启动命令和验收步骤见 [MiMo-V2.6-Flash-RL-GPTQ适配说明.md](./MiMo-V2.6-Flash-RL-GPTQ适配说明.md)。
+先运行 `bash tests/run_mimo_v26_flash_rl_w4a8.sh --preflight`，正式量化运行
+`bash tests/run_mimo_v26_flash_rl_w4a8.sh`。默认四卡，输出使用独立 GPTQ 目录。
+
+> Qwen3.5 多模态包装类只量化文本主干；视觉塔 (`model.visual.*`) 与 MTP 头 (`mtp.*`)
 > 以 BF16 原样搬运到打包产物，不参与 GPTQ，也不会被丢弃。
 
 详见 [MoE-Quant-ignore改造说明.md](./MoE-Quant-ignore改造说明.md)。
