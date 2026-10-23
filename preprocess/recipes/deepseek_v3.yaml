@@ -1,8 +1,9 @@
 # DeepSeek-V3 preprocess recipe
 #
 # Adapter: preprocess/adapters/deepseek_v3.py
-# Official weights are block FP8 — streaming unpack to ``{save-dir}.bf16_staging``
-# before multi-GPU transforms (same pattern as Kimi MXFP4).
+# Official weights are block FP8 — multi-GPU unpack to ``{save-dir}.bf16_staging``
+# (1:1 shard filenames vs source) before layer-parallel transforms.
+# GPU count for unpack defaults to ``--preprocess-gpus``; override with unpack_fp8_gpus.
 #
 # QuaRot: RMSNorm fuse + Hadamard on hidden / q_lora / kv_lora (MLA).
 # Flex AWQ: dense mlp.up_proj, shared_experts.up_proj, experts.*.up_proj.
@@ -11,6 +12,8 @@
 adapter: deepseek_v3
 
 unpack_fp8: true
+# Optional: override unpack GPU count (default = --preprocess-gpus)
+unpack_fp8_gpus: 8
 
 transforms:
   - quarot

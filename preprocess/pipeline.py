@@ -24,6 +24,8 @@ def _maybe_unpack_to_bf16(
     save_dir: str,
     recipe: Dict[str, Any],
     adapter_name: str,
+    *,
+    num_gpus: int = 1,
 ) -> str:
     """Stream-unpack packed/quantized HF weights to a BF16 staging dir if needed."""
     staging = str(Path(save_dir).resolve()) + ".bf16_staging"
@@ -47,17 +49,19 @@ def _maybe_unpack_to_bf16(
     if adapter_name == "deepseek_v3":
         if not recipe.get("unpack_fp8", True):
             return model_dir
-        from preprocess.adapters.deepseek_v3 import DeepSeekV3Adapter
+        from preprocess.unpack.fp8 import model_needs_fp8_unpack, unpack_fp8_checkpoint
 
-        if not DeepSeekV3Adapter.model_needs_fp8_unpack(model_dir):
+        if not model_needs_fp8_unpack(model_dir):
             logger.info("preprocess: no FP8 scales under {}; skip staging unpack", model_dir)
             return model_dir
+        unpack_gpus = int(recipe.get("unpack_fp8_gpus") or num_gpus or 1)
         logger.info(
-            "preprocess: streaming block-FP8→BF16 unpack {} -> {} (before multi-GPU)",
+            "preprocess: block-FP8→BF16 unpack {} -> {} (gpus={}, 1:1 shards)",
             model_dir,
             staging,
+            unpack_gpus,
         )
-        DeepSeekV3Adapter.unpack_fp8_checkpoint(model_dir, staging)
+        unpack_fp8_checkpoint(model_dir, staging, num_gpus=unpack_gpus)
         return staging
 
     return model_dir
@@ -68,9 +72,13 @@ def _maybe_unpack_kimi_mxfp4(
     save_dir: str,
     recipe: Dict[str, Any],
     adapter_name: str,
+    *,
+    num_gpus: int = 1,
 ) -> str:
     """Back-compat alias for ``_maybe_unpack_to_bf16``."""
-    return _maybe_unpack_to_bf16(model_dir, save_dir, recipe, adapter_name)
+    return _maybe_unpack_to_bf16(
+        model_dir, save_dir, recipe, adapter_name, num_gpus=num_gpus
+    )
 
 
 def _default_recipe_path() -> Path:
@@ -166,7 +174,9 @@ def run_preprocess(
     adapter_name = resolve_adapter_name(recipe, config)
     # Streaming unpack before opening WeightStore for transforms (avoids RAM OOM).
     if finalize and rank == 0 and world_size == 1:
-        model_dir = _maybe_unpack_kimi_mxfp4(model_dir, save_dir, recipe, adapter_name)
+        model_dir = _maybe_unpack_kimi_mxfp4(
+            model_dir, save_dir, recipe, adapter_name, num_gpus=1
+        )
         config = load_hf_config(model_dir)
 
     adapter = get_adapter(adapter_name)
@@ -380,8 +390,11 @@ def run_preprocess_multiprocess(
     recipe = load_recipe(recipe_path)
     config = load_hf_config(model_dir)
     adapter_name = resolve_adapter_name(recipe, config)
-    # Unpack once in the parent process before spawning GPU workers.
-    model_dir = _maybe_unpack_kimi_mxfp4(model_dir, save_dir, recipe, adapter_name)
+    # Unpack once in the parent process before spawning GPU transform workers.
+    # DeepSeek FP8 unpack itself can use the same GPU count (1:1 shard files).
+    model_dir = _maybe_unpack_kimi_mxfp4(
+        model_dir, save_dir, recipe, adapter_name, num_gpus=gpus
+    )
 
     tlist = list(transforms) if transforms else None
     recipe_s = str(recipe_path) if recipe_path else None
