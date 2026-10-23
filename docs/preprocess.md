@@ -98,7 +98,7 @@ python3 main.py --alg preprocess \
   --preprocess-gpus 8
 ```
 
-说明：官方权重是 **block FP8**（`e4m3` + `weight_scale_inv`，128×128）。流水线会先单进程流式解包到 `{save-dir}.bf16_staging`（约 1.3T+），再 8 卡按层做 QuaRot / Flex。Adapter 覆盖 MLA（`q_a/q_b`、`kv_a/kv_b`）、dense MLP（`first_k_dense_replace`）、逐专家 `experts.{i}.*`、`shared_experts`，以及 `layers.{num_hidden_layers}` 的 MTP（`shared_head`；`enorm`/`hnorm`→`eh_proj` 不做 Norm fuse，因此 **不旋转** `eh_proj`）。缺 `weight_scale_inv` 时解包会直接报错，不会把「半解包」目录标成完成。解包后 `config.quantization_config` 会去掉。磁盘需预留 staging + 最终目录空间。
+说明：官方权重是 **block FP8**（`e4m3` + `weight_scale_inv`，128×128）。流水线会先按 `--preprocess-gpus` **多卡**解包到 `{save-dir}.bf16_staging`（约 1.3T+；每个源 shard 对应 **同名** 一个 BF16 safetensors，不再拆 `.uXXX`），再 8 卡按层做 QuaRot / Flex。可用 recipe `unpack_fp8_gpus` 单独覆盖解包卡数。Adapter 覆盖 MLA（`q_a/q_b`、`kv_a/kv_b`）、dense MLP（`first_k_dense_replace`）、逐专家 `experts.{i}.*`、`shared_experts`，以及 `layers.{num_hidden_layers}` 的 MTP（`shared_head`；`enorm`/`hnorm`→`eh_proj` 不做 Norm fuse，因此 **不旋转** `eh_proj`）。缺 `weight_scale_inv` 时解包会直接报错，不会把「半解包」目录标成完成。解包后 `config.quantization_config` 会去掉。磁盘需预留 staging + 最终目录空间。
 
 ---
 

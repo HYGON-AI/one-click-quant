@@ -10,6 +10,9 @@ Weight layout (HF ``DeepseekV3ForCausalLM``)::
 Official DeepSeek-V3 checkpoints ship **block FP8** (``float8_e4m3fn`` +
 ``weight_scale_inv``, block 128×128). Streaming unpack writes BF16 staging
 before QuaRot / Flex (same role as Kimi MXFP4 unpack).
+
+Unpack keeps **1:1 shard filenames** vs the source checkpoint and can run
+multi-GPU (one process per GPU, shards round-robin by ``--preprocess-gpus``).
 """
 
 from __future__ import annotations
@@ -19,11 +22,13 @@ import json
 import math
 import re
 import shutil
+import struct
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from loguru import logger
 from safetensors import safe_open
@@ -43,6 +48,7 @@ _FP8_DTYPES = (
     getattr(torch, "float8_e5m2fnuz", torch.float8_e5m2),
 )
 _FP8_GROUP_SIZE = 128
+_UNPACK_WM_RANK = ".unpack_wm_rank{}.json"
 
 
 def dequantize_weight_from_fp8(
@@ -50,6 +56,7 @@ def dequantize_weight_from_fp8(
     scale_inv: torch.Tensor,
     *,
     group_size: int = _FP8_GROUP_SIZE,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """DeepSeek-style block FP8 → BF16 (``W * scale_inv``, block ``group_size``)."""
     if weight.dim() != 2:
@@ -58,6 +65,9 @@ def dequantize_weight_from_fp8(
     d_out, d_in = weight.shape
     pad_out = math.ceil(d_out / g) * g - d_out
     pad_in = math.ceil(d_in / g) * g - d_in
+    if device is not None:
+        weight = weight.to(device=device, non_blocking=True)
+        scale_inv = scale_inv.to(device=device, non_blocking=True)
     w = F.pad(weight.float(), (0, pad_in, 0, pad_out))
     s = scale_inv.float()
     d_out_pad, d_in_pad = w.shape
@@ -74,6 +84,230 @@ def dequantize_weight_from_fp8(
     s = s.view(d_out_pad // g, 1, d_in_pad // g, 1)
     out = (w * s).view(d_out_pad, d_in_pad)[:d_out, :d_in]
     return out.to(torch.bfloat16)
+
+
+def _write_safetensors(path: Path, tensors: Dict[str, torch.Tensor]) -> None:
+    """Write one safetensors file; allow empty (scale-only source shards)."""
+    if tensors:
+        save_file(tensors, str(path))
+        return
+    # Valid empty archive: 8-byte header length + 8-byte-aligned JSON "{}".
+    meta = b"{}"
+    pad = (8 - len(meta) % 8) % 8
+    meta = meta + b" " * pad
+    path.write_bytes(struct.pack("<Q", len(meta)) + meta)
+
+
+def _expected_non_scale_keys(keys: List[str]) -> Set[str]:
+    return {k for k in keys if not k.endswith(".weight_scale_inv")}
+
+
+def _shard_output_complete(dst_shard: Path, expected: Set[str]) -> bool:
+    if not expected:
+        return dst_shard.is_file()
+    if not dst_shard.is_file():
+        return False
+    try:
+        with safe_open(dst_shard, framework="pt", device="cpu") as f:
+            have = set(f.keys())
+    except Exception:
+        return False
+    return have == expected
+
+
+def _cleanup_legacy_u_parts(dst: Path, stem: str) -> None:
+    for p in dst.glob(f"{stem}.u*.safetensors"):
+        p.unlink(missing_ok=True)
+
+
+def _unpack_one_fp8_shard(
+    *,
+    src: Path,
+    dst: Path,
+    shard: str,
+    keys: List[str],
+    weight_map: Dict[str, str],
+    group_size: int,
+    device: torch.device,
+) -> Tuple[Dict[str, str], int]:
+    """Unpack one source shard → one same-named BF16 safetensors. Returns (wm, n)."""
+    fp8_mods = {
+        k[: -len(".weight")]
+        for k in keys
+        if k.endswith(".weight") and f"{k}_scale_inv" in weight_map
+    }
+    for k in keys:
+        if k.endswith(".weight_scale_inv"):
+            wname = k[: -len("_scale_inv")]
+            if wname.endswith(".weight"):
+                fp8_mods.add(wname[: -len(".weight")])
+
+    out_path = dst / shard
+    new_wm: Dict[str, str] = {}
+
+    if not fp8_mods:
+        shutil.copy2(src / shard, out_path)
+        for k in keys:
+            new_wm[k] = shard
+        return new_wm, 0
+
+    out: Dict[str, torch.Tensor] = {}
+    unpacked = 0
+    with safe_open(src / shard, framework="pt", device="cpu") as f:
+        local_keys = set(f.keys())
+        for k in keys:
+            if k.endswith(".weight_scale_inv"):
+                continue
+            if k.endswith(".weight"):
+                mod = k[: -len(".weight")]
+                if mod in fp8_mods:
+                    continue
+            if k not in local_keys:
+                continue
+            t = f.get_tensor(k)
+            if k.endswith(".weight") and t.dtype in _FP8_DTYPES:
+                raise RuntimeError(
+                    "deepseek_v3 unpack: FP8 weight "
+                    f"{k} has no weight_scale_inv in the index; "
+                    "refusing to copy raw FP8 or mark unpack complete."
+                )
+            out[k] = t
+
+        for mod in sorted(fp8_mods):
+            w_key = f"{mod}.weight"
+            s_key = f"{mod}.weight_scale_inv"
+            if w_key not in local_keys:
+                continue
+            if s_key not in weight_map:
+                raise RuntimeError(
+                    "deepseek_v3 unpack: missing weight_scale_inv for "
+                    f"{w_key}; refusing to copy raw FP8 or mark unpack complete."
+                )
+            w = f.get_tensor(w_key)
+            scale_shard = weight_map[s_key]
+            if scale_shard == shard and s_key in local_keys:
+                s = f.get_tensor(s_key)
+            else:
+                with safe_open(src / scale_shard, framework="pt", device="cpu") as fs:
+                    s = fs.get_tensor(s_key)
+            if w.dtype not in _FP8_DTYPES:
+                out[w_key] = w
+                continue
+            bf16 = dequantize_weight_from_fp8(
+                w, s, group_size=group_size, device=device
+            )
+            if bf16.device.type != "cpu":
+                bf16 = bf16.cpu()
+            bf16 = bf16.contiguous()
+            del w, s
+            out[w_key] = bf16
+            unpacked += 1
+
+    _write_safetensors(out_path, out)
+    for k in out:
+        new_wm[k] = shard
+    del out
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    return new_wm, unpacked
+
+
+def _unpack_fp8_worker(
+    rank: int,
+    world_size: int,
+    src_s: str,
+    dst_s: str,
+    shards: List[str],
+    by_shard: Dict[str, List[str]],
+    weight_map: Dict[str, str],
+    group_size: int,
+    use_cuda: bool,
+) -> None:
+    """mp.spawn entry: unpack shards where ``i % world_size == rank``."""
+    src = Path(src_s)
+    dst = Path(dst_s)
+    if use_cuda:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cpu")
+
+    new_wm: Dict[str, str] = {}
+    total_unpacked = 0
+    mine = [(i, sh) for i, sh in enumerate(shards) if i % world_size == rank]
+    logger.info(
+        "deepseek_v3 unpack rank {}/{}: {} shards on {} (group={})",
+        rank,
+        world_size,
+        len(mine),
+        device,
+        group_size,
+    )
+
+    for si, shard in mine:
+        keys = by_shard[shard]
+        expected = _expected_non_scale_keys(keys)
+        stem = Path(shard).stem
+        _cleanup_legacy_u_parts(dst, stem)
+        out_path = dst / shard
+        if _shard_output_complete(out_path, expected):
+            with safe_open(out_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    new_wm[k] = shard
+            logger.info(
+                "[{}/{}] rank{} resume skip {}",
+                si + 1,
+                len(shards),
+                rank,
+                shard,
+            )
+            continue
+        if out_path.is_file():
+            out_path.unlink(missing_ok=True)
+
+        wm, n = _unpack_one_fp8_shard(
+            src=src,
+            dst=dst,
+            shard=shard,
+            keys=keys,
+            weight_map=weight_map,
+            group_size=group_size,
+            device=device,
+        )
+        new_wm.update(wm)
+        total_unpacked += n
+        logger.info(
+            "[{}/{}] rank{} wrote {} ({} tensors, {} fp8→bf16, device={})",
+            si + 1,
+            len(shards),
+            rank,
+            shard,
+            len(wm),
+            n,
+            device,
+        )
+
+    manifest = dst / _UNPACK_WM_RANK.format(rank)
+    manifest.write_text(
+        json.dumps(
+            {
+                "rank": rank,
+                "weight_map": new_wm,
+                "unpacked_modules": total_unpacked,
+                "shards_done": [sh for _, sh in mine],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        "deepseek_v3 unpack rank {}/{} finished: {} modules",
+        rank,
+        world_size,
+        total_unpacked,
+    )
 
 
 def _is_dense_mlp(cfg: Dict[str, Any], layer_idx: int) -> bool:
@@ -248,19 +482,20 @@ class DeepSeekV3Adapter(ModelAdapter):
         src_dir: str | Path,
         dst_dir: str | Path,
         *,
-        batch_tensors: int = 64,
+        num_gpus: int = 1,
         group_size: Optional[int] = None,
     ) -> Path:
-        """Stream block-FP8 → BF16 to ``dst_dir`` (low memory, before multi-GPU)."""
+        """Stream block-FP8 → BF16 to ``dst_dir`` (1:1 shard names, optional multi-GPU).
+
+        Each source ``*.safetensors`` becomes exactly one same-named file under
+        ``dst_dir`` (no ``.uXXX`` splits). With ``num_gpus > 1``, shards are
+        round-robin'd across CUDA devices; dequant runs on GPU then writes CPU.
+        """
         src = Path(src_dir).resolve()
         dst = Path(dst_dir).resolve()
         if src == dst:
             raise ValueError("unpack_fp8_checkpoint: src and dst must differ")
         marker = dst / "UNPACK_FP8_DONE.json"
-        if marker.is_file() and (dst / "model.safetensors.index.json").is_file():
-            logger.info("deepseek_v3 unpack: reuse existing staging {}", dst)
-            return dst
-
         index_path = src / "model.safetensors.index.json"
         if not index_path.is_file():
             raise FileNotFoundError(f"missing index under {src}")
@@ -275,16 +510,57 @@ class DeepSeekV3Adapter(ModelAdapter):
         by_shard: Dict[str, List[str]] = defaultdict(list)
         for name, shard in weight_map.items():
             by_shard[shard].append(name)
+        shards = sorted(by_shard.keys())
+
+        if marker.is_file() and (dst / "model.safetensors.index.json").is_file():
+            try:
+                done = json.loads(marker.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                done = {}
+            # Legacy staging used ``*.uXXX.safetensors`` splits — force re-unpack
+            # so shard count matches the source 1:1.
+            legacy_u = list(dst.glob("*.u*.safetensors"))
+            one_to_one = bool(done.get("one_to_one_shards")) and all(
+                (dst / sh).is_file() for sh in shards
+            )
+            if one_to_one and not legacy_u:
+                logger.info("deepseek_v3 unpack: reuse existing staging {}", dst)
+                return dst
+            logger.warning(
+                "deepseek_v3 unpack: staging {} is legacy/incomplete "
+                "(one_to_one={}, legacy_u_parts={}); re-unpacking",
+                dst,
+                bool(done.get("one_to_one_shards")),
+                len(legacy_u),
+            )
+            marker.unlink(missing_ok=True)
+            for p in legacy_u:
+                p.unlink(missing_ok=True)
+
+        world_size = max(1, int(num_gpus or 1))
+        use_cuda = False
+        if world_size > 1:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"unpack_fp8_checkpoint num_gpus={world_size} requires CUDA"
+                )
+            if torch.cuda.device_count() < world_size:
+                raise RuntimeError(
+                    f"Requested num_gpus={world_size} but only "
+                    f"{torch.cuda.device_count()} CUDA device(s) visible"
+                )
+            use_cuda = True
+        elif torch.cuda.is_available():
+            use_cuda = True
+            world_size = 1
 
         dst.mkdir(parents=True, exist_ok=True)
-        # Resume: keep existing .uXXX / copied shards instead of wiping ~1T staging.
-        existing_parts = list(dst.glob("*.safetensors"))
-        resume = bool(existing_parts)
-        if resume:
+        n_existing = len(list(dst.glob("*.safetensors")))
+        if n_existing:
             logger.info(
                 "deepseek_v3 unpack: resume staging {} ({} existing safetensors)",
                 dst,
-                len(existing_parts),
+                n_existing,
             )
 
         for item in src.iterdir():
@@ -297,192 +573,78 @@ class DeepSeekV3Adapter(ModelAdapter):
                 if not target.is_file():
                     shutil.copy2(item, target)
 
-        new_wm: Dict[str, str] = {}
-        total_unpacked = 0
-        missing_scales: List[str] = []
-        raw_fp8_copied: List[str] = []
-        shards = sorted(by_shard.keys())
+        # Drop stale per-rank manifests from a previous crashed run.
+        for r in range(max(world_size, 64)):
+            p = dst / _UNPACK_WM_RANK.format(r)
+            if p.is_file():
+                p.unlink(missing_ok=True)
+
         logger.info(
-            "deepseek_v3 streaming FP8 unpack: {} shards {} -> {} (group={}, batch={}, resume={})",
+            "deepseek_v3 FP8 unpack: {} shards {} -> {} (group={}, gpus={}, cuda={})",
             len(shards),
             src,
             dst,
             g,
-            batch_tensors,
-            resume,
+            world_size,
+            use_cuda,
         )
 
-        def _collect_existing_parts(stem: str) -> List[Path]:
-            parts = sorted(dst.glob(f"{stem}.u*.safetensors"))
-            copied = dst / f"{stem}.safetensors"
-            if copied.is_file():
-                return [copied]
-            return parts
-
-        def _ingest_existing(paths: List[Path]) -> int:
-            n_keys = 0
-            for p in paths:
-                with safe_open(p, framework="pt", device="cpu") as f:
-                    for k in f.keys():
-                        new_wm[k] = p.name
-                        n_keys += 1
-            return n_keys
-
-        for si, shard in enumerate(shards):
-            keys = by_shard[shard]
-            stem = Path(shard).stem
-            existing = _collect_existing_parts(stem)
-            if existing:
-                n_keys = _ingest_existing(existing)
-                # Treat a shard as done only when we recovered every non-scale key.
-                expected = {
-                    k
-                    for k in keys
-                    if not k.endswith(".weight_scale_inv")
-                }
-                have = expected & set(new_wm)
-                if have == expected:
-                    logger.info(
-                        "[{}/{}] resume skip {} ({} files, {} tensors)",
-                        si + 1,
-                        len(shards),
-                        shard,
-                        len(existing),
-                        n_keys,
-                    )
-                    continue
-                # Partial shard: drop incomplete parts and re-unpack this shard.
-                logger.warning(
-                    "[{}/{}] incomplete {} ({}/{} keys); re-unpack",
-                    si + 1,
-                    len(shards),
-                    shard,
-                    len(have),
-                    len(expected),
-                )
-                for p in existing:
-                    p.unlink(missing_ok=True)
-                    for k, s in list(new_wm.items()):
-                        if s == p.name:
-                            new_wm.pop(k, None)
-
-            fp8_mods = {
-                k[: -len(".weight")]
-                for k in keys
-                if k.endswith(".weight") and f"{k}_scale_inv" in weight_map
-            }
-            # Also detect scales present in this shard pointing at weights.
-            for k in keys:
-                if k.endswith(".weight_scale_inv"):
-                    wname = k[: -len("_scale_inv")]
-                    if wname.endswith(".weight"):
-                        fp8_mods.add(wname[: -len(".weight")])
-
-            if not fp8_mods:
-                shutil.copy2(src / shard, dst / shard)
-                for k in keys:
-                    new_wm[k] = shard
-                logger.info("[{}/{}] copy {}", si + 1, len(shards), shard)
-                continue
-
-            part_idx = 0
-            batch: Dict[str, torch.Tensor] = {}
-            unpacked_in_batch = 0
-
-            def flush_batch() -> None:
-                nonlocal part_idx, unpacked_in_batch, batch
-                if not batch:
-                    return
-                out_name = f"{Path(shard).stem}.u{part_idx:03d}.safetensors"
-                save_file(batch, str(dst / out_name))
-                for k in batch:
-                    new_wm[k] = out_name
-                logger.info(
-                    "[{}/{}] wrote {} ({} tensors, {} fp8→bf16)",
-                    si + 1,
-                    len(shards),
-                    out_name,
-                    len(batch),
-                    unpacked_in_batch,
-                )
-                part_idx += 1
-                unpacked_in_batch = 0
-                batch = {}
-                gc.collect()
-
-            # Scales may live in another shard; open per-key as needed.
-            with safe_open(src / shard, framework="pt", device="cpu") as f:
-                local_keys = set(f.keys())
-                for k in keys:
-                    if k.endswith(".weight_scale_inv"):
-                        continue
-                    if k.endswith(".weight"):
-                        mod = k[: -len(".weight")]
-                        if mod in fp8_mods:
-                            continue
-                    if k not in local_keys:
-                        continue
-                    t = f.get_tensor(k)
-                    # FP8 weight without a registered scale must not be written.
-                    # Writing it would let a later resume treat the shard as complete
-                    # and stamp deepseek_fp8_unpacked=True.
-                    if k.endswith(".weight") and t.dtype in _FP8_DTYPES:
-                        raw_fp8_copied.append(k)
-                        raise RuntimeError(
-                            "deepseek_v3 unpack: FP8 weight "
-                            f"{k} has no weight_scale_inv in the index; "
-                            "refusing to copy raw FP8 or mark unpack complete."
-                        )
-                    batch[k] = t
-                    if len(batch) >= 256:
-                        flush_batch()
-
-                for mod in sorted(fp8_mods):
-                    w_key = f"{mod}.weight"
-                    s_key = f"{mod}.weight_scale_inv"
-                    if w_key not in local_keys:
-                        continue
-                    if s_key not in weight_map:
-                        missing_scales.append(mod)
-                        raise RuntimeError(
-                            "deepseek_v3 unpack: missing weight_scale_inv for "
-                            f"{w_key}; refusing to copy raw FP8 or mark unpack complete."
-                        )
-                    w = f.get_tensor(w_key)
-                    scale_shard = weight_map[s_key]
-                    if scale_shard == shard and s_key in local_keys:
-                        s = f.get_tensor(s_key)
-                    else:
-                        with safe_open(src / scale_shard, framework="pt", device="cpu") as fs:
-                            s = fs.get_tensor(s_key)
-                    if w.dtype not in _FP8_DTYPES:
-                        batch[w_key] = w
-                        continue
-                    bf16 = dequantize_weight_from_fp8(w, s, group_size=g).contiguous()
-                    del w, s
-                    batch[w_key] = bf16
-                    unpacked_in_batch += 1
-                    total_unpacked += 1
-                    if unpacked_in_batch >= batch_tensors:
-                        flush_batch()
-                flush_batch()
-
-            logger.info(
-                "[{}/{}] done {} (unpacked running total={})",
-                si + 1,
-                len(shards),
-                shard,
-                total_unpacked,
+        if world_size == 1:
+            _unpack_fp8_worker(
+                0,
+                1,
+                str(src),
+                str(dst),
+                shards,
+                dict(by_shard),
+                weight_map,
+                g,
+                use_cuda,
+            )
+        else:
+            mp.spawn(
+                _unpack_fp8_worker,
+                args=(
+                    world_size,
+                    str(src),
+                    str(dst),
+                    shards,
+                    dict(by_shard),
+                    weight_map,
+                    g,
+                    use_cuda,
+                ),
+                nprocs=world_size,
+                join=True,
             )
 
-        if missing_scales or raw_fp8_copied:
-            examples = (missing_scales[:5] + raw_fp8_copied[:5])[:8]
+        new_wm: Dict[str, str] = {}
+        total_unpacked = 0
+        for r in range(world_size):
+            manifest = dst / _UNPACK_WM_RANK.format(r)
+            if not manifest.is_file():
+                raise FileNotFoundError(
+                    f"deepseek_v3 unpack: missing rank manifest {manifest}"
+                )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            new_wm.update(payload.get("weight_map") or {})
+            total_unpacked += int(payload.get("unpacked_modules") or 0)
+            manifest.unlink(missing_ok=True)
+
+        # Every source shard must exist under dst with the same filename.
+        missing_files = [sh for sh in shards if not (dst / sh).is_file()]
+        if missing_files:
             raise RuntimeError(
-                "deepseek_v3 FP8 unpack incomplete: "
-                f"missing_scale_modules={len(missing_scales)}, "
-                f"raw_fp8_weights={len(raw_fp8_copied)} "
-                f"(e.g. {examples}). Refusing to mark unpack complete."
+                "deepseek_v3 FP8 unpack incomplete: missing output shards "
+                f"({len(missing_files)}), e.g. {missing_files[:5]}"
             )
+        # Validate non-scale keys are present (or shard was scale-only / empty).
+        for sh in shards:
+            expected = _expected_non_scale_keys(by_shard[sh])
+            if not _shard_output_complete(dst / sh, expected):
+                raise RuntimeError(
+                    f"deepseek_v3 FP8 unpack incomplete for shard {sh}"
+                )
 
         if cfg_path.is_file():
             cfg_out = dict(cfg)
@@ -496,12 +658,17 @@ class DeepSeekV3Adapter(ModelAdapter):
         from preprocess.io import _safetensors_header_nbytes
 
         total = 0
-        for sh in sorted(set(new_wm.values())):
+        for sh in shards:
             p = dst / sh
             if p.is_file():
                 total += _safetensors_header_nbytes(p)
         out_index = {
-            "metadata": {**(idx.get("metadata") or {}), "total_size": total},
+            "metadata": {
+                **(idx.get("metadata") or {}),
+                "total_size": total,
+                "deepseek_fp8_unpack_1to1": True,
+                "unpack_gpus": world_size,
+            },
             "weight_map": new_wm,
         }
         (dst / "model.safetensors.index.json").write_text(
@@ -514,6 +681,9 @@ class DeepSeekV3Adapter(ModelAdapter):
                     "source": str(src),
                     "unpacked_modules": total_unpacked,
                     "group_size": g,
+                    "num_gpus": world_size,
+                    "shard_count": len(shards),
+                    "one_to_one_shards": True,
                 },
                 indent=2,
             )
@@ -521,10 +691,12 @@ class DeepSeekV3Adapter(ModelAdapter):
             encoding="utf-8",
         )
         logger.info(
-            "deepseek_v3 streaming FP8 unpack finished: {} modules -> {} ({:.2f} GiB)",
+            "deepseek_v3 FP8 unpack finished: {} modules, {} shards -> {} ({:.2f} GiB, gpus={})",
             total_unpacked,
+            len(shards),
             dst,
             total / 1024**3,
+            world_size,
         )
         return dst
 
