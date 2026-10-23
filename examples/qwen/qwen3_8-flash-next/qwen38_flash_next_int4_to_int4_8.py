@@ -1,7 +1,7 @@
 """
 Qwen3.8-Flash-Next-INT4 → INT4(experts) + INT8(W8 include layers).
 
-Input: checkpoint from qwen38_flash_bf16_experts_to_int4.py
+Input: checkpoint from qwen38_flash_next_bf16_experts_to_int4.py
   - fused experts: packed INT4 + ``.weight_scale`` (kept as-is)
   - other Linear: BF16 ``.weight``
 
@@ -16,9 +16,9 @@ Kept BF16 (Flash-Next / Kimi-style ignore):
   - hyper_connection*, indexer*, ple*, visual*, embed, lm_head, mtp*
 
 Usage:
-  python qwen38_flash_int4_to_int4_8.py
-  python qwen38_flash_int4_to_int4_8.py --dry-run
-  python qwen38_flash_int4_to_int4_8.py \\
+  python qwen38_flash_next_int4_to_int4_8.py
+  python qwen38_flash_next_int4_to_int4_8.py --dry-run
+  python qwen38_flash_next_int4_to_int4_8.py \\
       --input-path /module/Qwen3.8-Flash-Next-INT4 \\
       --output-path /module/Qwen3.8-Flash-Next-w4a8-slimquant
 """
@@ -391,7 +391,7 @@ def main(input_path: str, output_path: str | None, dry_run: bool) -> None:
 
     done_path = dst_dir / "QUANTIZATION_DONE.txt"
     with open(done_path, "w", encoding="utf-8") as f:
-        f.write("qwen38_flash_int4_to_int4_8.py completed\n")
+        f.write("qwen38_flash_next_int4_to_int4_8.py completed\n")
         f.write(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
         f.write("\n")
 

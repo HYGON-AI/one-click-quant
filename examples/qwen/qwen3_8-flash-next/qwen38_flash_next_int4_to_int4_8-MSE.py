@@ -2,7 +2,7 @@
 Compare BF16 source vs INT8 reconstruction for all W8 include layers
 under /module/Qwen3.8-Flash-Next-w4a8-slimquant.
 
-W8 include (same as qwen38_flash_int4_to_int4_8.py):
+W8 include (same as qwen38_flash_next_int4_to_int4_8.py):
   - self_attn.{q,k,v}_proj
   - mlp.shared_expert.{gate,up,down}_proj
   - linear_attn.{in_proj_qkv,in_proj_z}
@@ -11,8 +11,8 @@ Default source is the Stage-1 INT4 checkpoint (those layers still BF16 there).
 You may also point --src at the original BF16 model.
 
 Usage (inside container):
-  python3 qwen38_flash_int4_to_int4_8-MSE.py
-  python3 qwen38_flash_int4_to_int4_8-MSE.py \\
+  python3 qwen38_flash_next_int4_to_int4_8-MSE.py
+  python3 qwen38_flash_next_int4_to_int4_8-MSE.py \\
       --src /module/Qwen3.8-Flash-Next-INT4 \\
       --dst /module/Qwen3.8-Flash-Next-w4a8-slimquant
 """

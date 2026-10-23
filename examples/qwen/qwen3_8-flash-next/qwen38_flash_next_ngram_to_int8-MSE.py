@@ -5,15 +5,15 @@ Default:
   src = /module/Qwen3.8-Flash-Next-w4a8-slimquant          (BF16 ngram)
   dst = /module/Qwen3.8-Flash-Next-w4a8-slimquant-ngram-int8
 
-Auto-detects scale layout produced by qwen38_flash_ngram_to_int8.py:
+Auto-detects scale layout produced by qwen38_flash_next_ngram_to_int8.py:
   - per_tensor:  ...ngram_embedding.weight_scale          # scalar (1,)
   - per_channel: ...ngram_embedding.shard_N.weight_scale  # (rows, 1)
 
 recon = int8.float() * scale
 
 Usage:
-  python3 qwen38_flash_ngram_to_int8-MSE.py
-  python3 qwen38_flash_ngram_to_int8-MSE.py \\
+  python3 qwen38_flash_next_ngram_to_int8-MSE.py
+  python3 qwen38_flash_next_ngram_to_int8-MSE.py \\
       --src /module/Qwen3.8-Flash-Next-w4a8-slimquant \\
       --dst /module/Qwen3.8-Flash-Next-w4a8-slimquant-ngram-int8
 """

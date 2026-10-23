@@ -24,9 +24,9 @@ This script only produces the checkpoint; serving still needs an INT8
 (or dequant-on-load) path.
 
 Usage:
-  python qwen38_flash_ngram_to_int8.py --dry-run
-  python qwen38_flash_ngram_to_int8.py
-  python qwen38_flash_ngram_to_int8.py --scale-mode per_channel
+  python qwen38_flash_next_ngram_to_int8.py --dry-run
+  python qwen38_flash_next_ngram_to_int8.py
+  python qwen38_flash_next_ngram_to_int8.py --scale-mode per_channel
 """
 
 from __future__ import annotations
@@ -418,7 +418,7 @@ def main(
 
     done_path = dst_dir / "QUANTIZATION_DONE.txt"
     with open(done_path, "w", encoding="utf-8") as f:
-        f.write("qwen38_flash_ngram_to_int8.py completed\n")
+        f.write("qwen38_flash_next_ngram_to_int8.py completed\n")
         f.write(f"scale_mode={scale_mode}\n")
         f.write(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
         f.write("\n")

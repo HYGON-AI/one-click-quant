@@ -15,12 +15,13 @@ INT4 convention (matching slimquant_w4a8 / Kimi offline scripts):
   - scale = abs_max / 7.0 / 16.0
   - pack: (even << 4) | odd along K
 
-MTP experts (``mtp.*``) are left BF16 by default.
+MTP (``mtp.*``) is left BF16 here; use ``qwen38_flash_next_mtp_to_w4a8.py``
+for MTP experts INT4 + attn/shared INT8.
 
 Usage:
-  python qwen38_flash_bf16_experts_to_int4.py
-  python qwen38_flash_bf16_experts_to_int4.py --dry-run
-  python qwen38_flash_bf16_experts_to_int4.py \\
+  python qwen38_flash_next_bf16_experts_to_int4.py
+  python qwen38_flash_next_bf16_experts_to_int4.py --dry-run
+  python qwen38_flash_next_bf16_experts_to_int4.py \\
       --input-path /model/Qwen/Qwen3.8-Flash-Next \\
       --output-path /module/Qwen3.8-Flash-Next-INT4
 """
@@ -45,21 +46,14 @@ from tqdm import tqdm
 DEFAULT_INPUT_PATH = "/model/Qwen/Qwen3.8-Flash-Next"
 DEFAULT_OUTPUT_PATH = "/module/Qwen3.8-Flash-Next-INT4"
 
-# Language-model fused experts only (exclude mtp.* unless --include-mtp).
+# Language-model fused experts only (mtp.* stays BF16 until Stage 4).
 EXPERT_BF16_RE = re.compile(
     r"(?:^|.*\.)language_model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$"
 )
-MTP_EXPERT_BF16_RE = re.compile(
-    r"^mtp\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$"
-)
 
 
-def is_expert_bf16_target(name: str, include_mtp: bool) -> bool:
-    if EXPERT_BF16_RE.match(name) is not None:
-        return True
-    if include_mtp and MTP_EXPERT_BF16_RE.match(name) is not None:
-        return True
-    return False
+def is_expert_bf16_target(name: str) -> bool:
+    return EXPERT_BF16_RE.match(name) is not None
 
 
 def expert_scale_name(weight_name: str) -> str:
@@ -133,7 +127,6 @@ def worker_process_shard(
     shared_weight_map,
     shared_stats,
     dry_run: bool,
-    include_mtp: bool,
 ):
     device = f"cuda:{rank}"
     torch.cuda.set_device(device)
@@ -148,7 +141,7 @@ def worker_process_shard(
 
         if dry_run:
             for weight_name, weight in state_dict.items():
-                if is_expert_bf16_target(weight_name, include_mtp):
+                if is_expert_bf16_target(weight_name):
                     if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
                         local_stats["expert_bf16"] = local_stats.get("expert_bf16", 0) + 1
                     else:
@@ -160,7 +153,7 @@ def worker_process_shard(
             continue
 
         for weight_name, weight in state_dict.items():
-            if is_expert_bf16_target(weight_name, include_mtp):
+            if is_expert_bf16_target(weight_name):
                 if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
                     raise TypeError(
                         f"Expert {weight_name} has dtype {weight.dtype}, "
@@ -233,7 +226,6 @@ def main(
     input_path: str,
     output_path: str | None,
     dry_run: bool,
-    include_mtp: bool,
 ) -> None:
     src_dir = Path(input_path)
     if not src_dir.exists():
@@ -258,14 +250,14 @@ def main(
         print("Dry run: Qwen3.8-Flash-Next BF16 experts → INT4")
         print(f"Input path: {src_dir}")
         print(f"Safetensor shards: {len(safetensor_files)}")
-        print(f"Include MTP experts: {include_mtp}")
+        print("MTP: left BF16 (use qwen38_flash_next_mtp_to_w4a8.py for MTP)")
         print("=" * 60)
 
         dry_stats: dict[str, int] = {}
         for sf in tqdm(safetensor_files, desc="scan"):
             with safe_open(sf, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    if is_expert_bf16_target(key, include_mtp):
+                    if is_expert_bf16_target(key):
                         dry_stats["expert_bf16"] = dry_stats.get("expert_bf16", 0) + 1
                     else:
                         dry_stats["kept_other"] = dry_stats.get("kept_other", 0) + 1
@@ -274,7 +266,7 @@ def main(
         print(json.dumps(dry_stats, indent=2, ensure_ascii=False, sort_keys=True))
         print(f"\nTotal entries: {sum(dry_stats.values())}")
         print("Fused experts will be quantized to per-channel INT4 (nibble-packed).")
-        print("All other weights kept as-is.")
+        print("All other weights (including MTP) kept as-is.")
         return
 
     if not output_path:
@@ -298,7 +290,7 @@ def main(
     print(f"GPUs: {world_size}  |  Shards: {len(safetensor_files)}")
     print(f"Input:  {src_dir}")
     print(f"Output: {dst_dir}")
-    print(f"Include MTP: {include_mtp}")
+    print("MTP: left BF16")
     print("=" * 60)
 
     manager = Manager()
@@ -314,7 +306,6 @@ def main(
             shared_weight_map,
             shared_stats,
             False,
-            include_mtp,
         ),
         nprocs=world_size,
         join=True,
@@ -350,7 +341,7 @@ def main(
 
     done_path = dst_dir / "QUANTIZATION_DONE.txt"
     with open(done_path, "w", encoding="utf-8") as f:
-        f.write("qwen38_flash_bf16_experts_to_int4.py completed\n")
+        f.write("qwen38_flash_next_bf16_experts_to_int4.py completed\n")
         f.write(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
         f.write("\n")
 
@@ -378,14 +369,9 @@ if __name__ == "__main__":
         help=f"INT4 intermediate directory (default: {DEFAULT_OUTPUT_PATH})",
     )
     parser.add_argument(
-        "--include-mtp",
-        action="store_true",
-        help="Also quantize mtp.layers.*.mlp.experts.* (default: keep MTP BF16)",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Analyze weights without writing files",
     )
     args = parser.parse_args()
-    main(args.input_path, args.output_path, args.dry_run, args.include_mtp)
+    main(args.input_path, args.output_path, args.dry_run)

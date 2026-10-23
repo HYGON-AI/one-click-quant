@@ -2,14 +2,14 @@
 Compare BF16 source vs INT4 reconstruction for fused expert weights
 under /module/Qwen3.8-Flash-Next-INT4.
 
-Matches packing in qwen38_flash_bf16_experts_to_int4.py:
+Matches packing in qwen38_flash_next_bf16_experts_to_int4.py:
   - per-channel scale along N; stored scale = abs_max / 7 / 16
   - K-nibble pack: (even << 4) | odd
   - recon = unpack_signed_int4(packed) * (scale * 16)
 
 Usage (inside container):
-  python3 qwen38_flash_bf16_experts_to_int4-MSE.py
-  python3 qwen38_flash_bf16_experts_to_int4-MSE.py \\
+  python3 qwen38_flash_next_bf16_experts_to_int4-MSE.py
+  python3 qwen38_flash_next_bf16_experts_to_int4-MSE.py \\
       --src /model/Qwen/Qwen3.8-Flash-Next \\
       --dst /module/Qwen3.8-Flash-Next-INT4
 """
