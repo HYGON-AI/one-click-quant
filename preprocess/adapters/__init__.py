@@ -6,16 +6,12 @@ from typing import Dict, Optional, Type
 
 from preprocess.adapters.base import ModelAdapter
 from preprocess.adapters.deepseek_v3 import DeepSeekV3Adapter
-from preprocess.adapters.kimi_k3 import KimiK3Adapter
 from preprocess.adapters.qwen3_8_flash_next import Qwen38FlashNextAdapter
 
 ADAPTER_REGISTRY: Dict[str, Type[ModelAdapter]] = {
-    KimiK3Adapter.name: KimiK3Adapter,
     Qwen38FlashNextAdapter.name: Qwen38FlashNextAdapter,
     DeepSeekV3Adapter.name: DeepSeekV3Adapter,
     # Aliases
-    "kimi-k3": KimiK3Adapter,
-    "moonshot_kimi_k3": KimiK3Adapter,
     "qwen3.8-flash-next": Qwen38FlashNextAdapter,
     "qwen3_8_flash": Qwen38FlashNextAdapter,
     "qwen4_exp": Qwen38FlashNextAdapter,
@@ -76,7 +72,6 @@ def resolve_adapter_name(recipe: dict, config: Optional[dict] = None) -> str:
 __all__ = [
     "ADAPTER_REGISTRY",
     "ModelAdapter",
-    "KimiK3Adapter",
     "Qwen38FlashNextAdapter",
     "DeepSeekV3Adapter",
     "get_adapter",

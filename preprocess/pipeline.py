@@ -49,9 +49,9 @@ def _maybe_unpack_to_bf16(
     if adapter_name == "deepseek_v3":
         if not recipe.get("unpack_fp8", True):
             return model_dir
-        from preprocess.adapters.deepseek_v3 import DeepSeekV3Adapter
+        from preprocess.unpack.fp8 import model_needs_fp8_unpack, unpack_fp8_checkpoint
 
-        if not DeepSeekV3Adapter.model_needs_fp8_unpack(model_dir):
+        if not model_needs_fp8_unpack(model_dir):
             logger.info("preprocess: no FP8 scales under {}; skip staging unpack", model_dir)
             return model_dir
         unpack_gpus = int(recipe.get("unpack_fp8_gpus") or num_gpus or 1)
@@ -61,9 +61,7 @@ def _maybe_unpack_to_bf16(
             staging,
             unpack_gpus,
         )
-        DeepSeekV3Adapter.unpack_fp8_checkpoint(
-            model_dir, staging, num_gpus=unpack_gpus
-        )
+        unpack_fp8_checkpoint(model_dir, staging, num_gpus=unpack_gpus)
         return staging
 
     return model_dir
