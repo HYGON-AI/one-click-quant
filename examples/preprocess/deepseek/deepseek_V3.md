@@ -9,7 +9,7 @@ cd one-click-quant
 
 python3 main.py --alg preprocess \
   --model /public/opendas/DL_DATA/llm-models/deepseek-ai/DeepSeek-V3 \
-  --save-dir /parastor/share/wufan/model/DeepSeek-V3-preprocessed \
+  --save-dir /module/DeepSeek-V3-preprocessed \
   --recipe preprocess/recipes/deepseek_v3.yaml \
   --transforms quarot,flex_awq_ssz,flex_smooth_quant \
   --preprocess-gpus 8
@@ -69,14 +69,14 @@ python3 pack_quantized_model.py \
 
 8 卡 transform + merge 已完成、只卡在 `rmtree(save_dir)` 时，**不必重跑整段预处理**。确认 staging 仍在：
 
-- `/parastor/share/wufan/model/DeepSeek-V3-preprocessed.bf16_staging`（含 `UNPACK_FP8_DONE.json`）
+- `/module/DeepSeek-V3-preprocessed.bf16_staging`（含 `UNPACK_FP8_DONE.json`）
 - `save_dir/.preprocess_shards/rank{0..7}.json` 与 rank spill（rank7 的 chunk 若已丢，脚本会用旧 `merge_spill` 补）
 
 ```bash
 cd one-click-quant
 python3 preprocess/resume_commit_inplace.py \
-  --staging /parastor/share/wufan/model/DeepSeek-V3-preprocessed.bf16_staging \
-  --save-dir /parastor/share/wufan/model/DeepSeek-V3-preprocessed \
+  --staging /module/DeepSeek-V3-preprocessed.bf16_staging \
+  --save-dir /module/DeepSeek-V3-preprocessed \
   --recipe preprocess/recipes/deepseek_v3.yaml \
   --transforms quarot,flex_awq_ssz,flex_smooth_quant \
   --gpus 8
@@ -85,7 +85,7 @@ python3 preprocess/resume_commit_inplace.py \
 成功后会写出最终目录和 `PREPROCESS_DONE.json`。验证无再删备份：
 
 ```bash
-rm -rf /parastor/share/wufan/model/.preprocess_shards_bak_DeepSeek-V3-preprocessed
+rm -rf /module/.preprocess_shards_bak_DeepSeek-V3-preprocessed
 ```
 
 ## 5. 导入失败：NumPy / SciPy
