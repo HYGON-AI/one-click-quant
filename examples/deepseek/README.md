@@ -2,7 +2,7 @@
 
 ```bash
 cd one-click-quant
-python3 /one-click-quant/examples/deepseek/deepseek_v4_w8a8_channel.py \
+python3 examples/deepseek/deepseek_v4_w8a8_channel.py \
   --input-dir /llm_models/data/DeepSeek-V4-Pro-0813 \
   --output-dir /quant_models/DeepSeek-V4-Pro-0813-Channel-FP8-W8A8 \
   --output-format fp8-channel \
@@ -38,5 +38,30 @@ python3 examples/deepseek/quantize_deepseek_v4_1_flash_mixed_int4_int8.py \
   --input-dir /llm_models/DeepSeek-V4.1-Flash \
   --output-dir /quant_models/DeepSeek-V4.1-Flash-Channel-INT4-w4a8 \
   --mtp-experts int4 --int8-p2 --int8-p3
+
+# OR
+
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_mixed_int4_int8.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-Channel-INT4-w4a8 \
+  --mtp-experts int4 --int8-p2 --int8-p3 --int8-wo-a
+
+```
+
+### DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8
+
+```bash
+cd one-click-quant
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash-1017 \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8 \
+  --num-threads 32
+
+# OR
+
+python3 examples/deepseek/quantize_deepseek_v4_1_flash_fp8_channel.py \
+  --input-dir /llm_models/DeepSeek-V4.1-Flash-1017 \
+  --output-dir /quant_models/DeepSeek-V4.1-Flash-1017-Channel-FP8-w8a8 \
+  --num-threads 32 --quantize-wo-a --quantize-markov-head --quantize-lm-head
 ```
 

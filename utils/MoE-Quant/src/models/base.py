@@ -21,6 +21,12 @@ class ModelAdapter:
     """
 
     name = "default"
+    load_only_required_tensors = False
+    # Whether save_extra_weights() accepts ``mtp_int8_ignore``/``mtp_pack_int8``
+    # (RTN INT8 for an MTP layer that bypasses GPTQ).
+    supports_mtp_int8 = False
+    # Whether save_extra_weights() also accepts ``mtp_pack_int4`` for routed experts.
+    supports_mtp_int4 = False
     _routed_expert_pattern = re.compile(
         r"(?:^|\.)mlp\.experts\.\d+\.(?:down|gate|up)_proj(?:\.|$)"
     )
@@ -88,6 +94,19 @@ class ModelAdapter:
     def validate_packing_args(self, args: Any) -> None:
         """Validate model-specific packed-checkpoint options."""
         del args
+
+    def quantization_metadata(self) -> Dict[str, Any]:
+        """Additional source provenance recorded with completed GPTQ results."""
+        return {}
+
+    def validate_quantization_metadata(self, metadata: Dict[str, Any]) -> None:
+        """Check adapter-specific provenance before consuming GPTQ results."""
+        del metadata
+
+    def pack_checkpoint(self, args: Any, metadata: Dict[str, Any]) -> bool:
+        """Return True after handling a model-specific streaming export."""
+        del args, metadata
+        return False
 
     def build_empty_model(
         self,
@@ -208,8 +227,14 @@ class ModelAdapter:
         self,
         ignore: Optional[Iterable[str]] = None,
         quantize_only_experts: bool = False,
+        force_int8: Optional[Iterable[str]] = None,
     ) -> List[str]:
-        """Combine structural defaults, the legacy flag and user patterns."""
+        """Combine structural defaults, the legacy flag and user patterns.
+
+        ``force_int8`` lets adapters release recipe defaults that the user
+        explicitly asks to quantize; the base adapter has none.
+        """
+        del force_int8
         rules: List[str] = list(self.default_ignore_rules())
         if quantize_only_experts:
             for rule in self.legacy_ignore_rules():
@@ -231,6 +256,26 @@ class ModelAdapter:
             elif rule == module_name:
                 return True
         return False
+
+    @classmethod
+    def resolve_layer_bits(
+        cls,
+        layer_name: str,
+        default_bits: int,
+        force_int8: Optional[Iterable[str]] = None,
+    ) -> int:
+        """Per-layer weight bit width: 8 for ``--force_int8`` matches, else the default."""
+        if force_int8 and cls.match_ignore(layer_name, force_int8):
+            return 8
+        return default_bits
+
+    def mtp_int8_ignore(self, rules: Iterable[str]) -> List[str]:
+        """Ignore list to use once the MTP layer is RTN-quantized."""
+        return list(rules)
+
+    def mtp_int4_targets(self) -> List[str]:
+        """Checkpoint and runtime targets for routed MTP experts stored as INT4."""
+        return []
 
     def get_quantization_ignore(self, quantize_only_experts: bool):
         """Legacy ``(rule_name, ignore list)`` entry point; delegates to resolve_ignore."""
