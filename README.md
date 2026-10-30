@@ -27,8 +27,8 @@
 以nv环境为例
 
 ```bash
-docker pull vllm/vllm-openai:v0.19.0
-docker run --gpus all -itd --entrypoint /bin/bash --privileged=true --network=host --device /dev/mem --shm-size=640g --name test_quant vllm/vllm-openai:v0.19.0
+docker pull vllm/vllm-openai:latest
+docker run --gpus all -itd --entrypoint /bin/bash --privileged=true --network=host --device /dev/mem --shm-size=200g --name test_quant vllm/vllm-openai:latest
 docker exec -it test_quant bash
 apt update
 apt install git
