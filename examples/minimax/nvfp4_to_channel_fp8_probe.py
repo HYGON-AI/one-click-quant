@@ -1,9 +1,35 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Validate NVFP4 -> FP32 -> channel FP8 on selected checkpoint matrices.
+"""Validate MiniMax-M3.1 NVFP4 -> FP32 -> per-channel E4M3FN FP8 on CPU.
 
-This is a matrix conversion probe, not a complete checkpoint exporter.
-The source checkpoint is read only. No accelerator or FP4 hardware is used.
+Requires torch, safetensors and compressed-tensors (tested with 2.11.0, 0.8.0
+and 0.17.0 on a synthetic checkpoint). No GPU or calibration dataset is needed.
+The model directory must contain model.safetensors.index.json and its shards.
+Samples (layer, expert) pairs (3, 0), (31, 63), (59, 127), each with w1/w2/w3
+under language_model.model.layers.<layer>.block_sparse_moe.experts.<expert>.
+
+For each [N, K] matrix, the required tensors are weight_packed (uint8 [N, K/2],
+low nibble first), weight_scale ([N, K/16]), weight_global_scale (one finite
+positive value), and input_global_scale (one value, recorded only).
+The checkpoint stores the weight global scale as an encoding multiplier:
+    W[i,j] = E2M1[i,j] * weight_scale[i,j//16] / weight_global_scale
+    s[i] = max(abs(W[i,:])) / 448  (use 1 for an all-zero row)
+    Q[i,j] = E4M3FN(clamp(W[i,j] / s[i], -448, 448))
+Q has shape [N, K]; the FP32 decode scale s has shape [N, 1].
+
+Checks all 256 byte patterns (including signed zero) and the sampled weight
+reconstructions against compressed-tensors. Run without python -O so these
+assertions remain enabled. Reports relative L2 errors for Q.float() * s versus
+W, and their FP32 linear outputs with random [8, K] inputs (seed 2026). No
+error threshold is imposed; W is the decoded FP4 weight, not the original
+high-precision weight. The reference uses compressed-tensors internal APIs.
+
+This is a matrix probe, not a checkpoint exporter or a W8A8 inference test:
+it does not process native FP8 matrices, quantize activations, run FP8 GEMM,
+or save Q/s and model configuration. Source checkpoint files are read only.
+--output optionally writes a JSON report; use a new path outside the model
+directory with an existing parent. Per-matrix results and REPORT=... also go
+to stdout. Real-model accuracy and performance require separate validation.
 """
 
 import argparse
