@@ -87,16 +87,19 @@ DeepSeek-V4.1-Flash FP4/FP8 block -> 混合精度 INT4/INT8 转换脚本
   mtp.*.attn.wo_a                      原 FP8 -> INT8  (同档, 理由同 p2 的 MTP 说明)
   !! stock sglang 不支持该开关产物 (主干/草稿 wo_a 不带 quant_config, MTP 接受率为 0)
 
-  !! 当前 vLLM 无法运行该选项的产物 !!
-    wo_a 带 `is_bmm=True`, o_proj 走手写路径 deep_gemm_fp8_o_proj
+  !! stock vLLM 无法直接运行该选项的产物, 需 wo_a 运行时 dequant patch !!
+    (patch: vllm/models/deepseek_v41/attention.py 的 _DequantInt8WoAMethod,
+     加载后把 INT8 wo_a 反量化为模型 dtype, 走现有 bf16 torch.bmm 分支;
+     运行期显存与 BF16 wo_a 相同, 仅节省磁盘约 1.3 GiB)
+    原因: wo_a 带 `is_bmm=True`, o_proj 走手写路径 deep_gemm_fp8_o_proj
     (vllm/models/deepseek_v4/nvidia/ops/o_proj.py:49-86), 只有 fp8 / bf16 两个
     分支。INT8 weight 经 CutlassInt8ScaledMMLinearKernel 加载后处理会被转置成
     (K, N) (scaled_mm/cutlass.py:50-55), 随后 `.view(n_groups, o_lora_rank, -1)`
     失败; 即使不失败, bf16 分支也不会乘 INT8 weight_scale。
     本开关只负责产出 "INT8 weight + fp32 per-out-channel weight_scale" 与对应
-    config, 供已自行为 wo_a 补了 INT8 分组 BMM kernel 的引擎使用
-    (需: o_proj 增加 INT8 分支 + 保持 weight 为 (N, K) 或按转置布局取用 +
-     激活改为 per-token INT8)。未打补丁的 vLLM 上启用会在 profile_run 首次前向崩溃。
+    config; 引擎侧要么打上述 dequant patch, 要么自带 INT8 分组 BMM kernel
+    (需: o_proj 增加 INT8 分支 + 保持 weight 为 (N, K) + 激活改为 per-token INT8)。
+    未打补丁的 vLLM 上启用会在 profile_run 首次前向崩溃。
   数值: wo_a 形状为 (n_groups*o_lora_rank, n_heads*head_dim/n_groups), 每个输出行
     只属于一个 group, per-output-channel 量化与分组 BMM 兼容。
   config: 单独成组 group_int8_wo_a, 并从 ignore 中移除 `attn.wo_a`。
@@ -171,6 +174,10 @@ DeepSeek-V4.1-Flash FP4/FP8 block -> 混合精度 INT4/INT8 转换脚本
   # MTP experts 升到 BF16
   python quantize_deepseek_v4_1_flash_mixed_int4_int8.py \\
       --mtp-experts bf16 --input-dir ... --output-dir ...
+
+  # 另外把 lm_head / MTP markov_head 量化为 INT8 (需引擎 patch 支持, 默认保持 BF16)
+  python quantize_deepseek_v4_1_flash_mixed_int4_int8.py \\
+      --quantize-lm-head --quantize-markov-head --input-dir ... --output-dir ...
 
   # 只转换前 N 个 shard 做冒烟测试
   python quantize_deepseek_v4_1_flash_mixed_int4_int8.py --limit-files 2 ...
@@ -296,8 +303,12 @@ P3_ATTN_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.wo_b\.weight$")
 # 草稿见 deepseek_v4_dspark.py wo_a_keeps_quant_config=False), 会把 INT8 当 BF16
 # 加载且丢弃 weight_scale, MTP 接受率为 0。
 WO_A_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.wo_a\.weight$")
+# 可选 (--quantize-markov-head): MTP 草稿的 markov_head.head (原始 BF16, 无 scale)
+MARKOV_HEAD_RE = re.compile(r"^mtp\.\d+\.markov_head\.head\.weight$")
+# 可选 (--quantize-lm-head): 顶层 head.weight 即运行时 lm_head (原始 BF16, 无 scale)
+LM_HEAD_NAME = "head.weight"
 # 优先级三: DSA indexer 的 query 投影
-P3_INDEXER_RE = re.compile(r"^(?:layers|mtp)\.\d+\.attn\.indexer\.wq_b\.weight$")
+P3_INDEXER_RE =re.compile(r"^(?:layers|mtp)\.\d+\.attn\.indexer\.wq_b\.weight$")
 
 # --------------------------------------------------------------------------- #
 # MTP/DSpark 子树的运行时前缀 (用于 config target)
@@ -338,6 +349,8 @@ class ConvOptions:
     int8_wo_a: bool = False       # 可选: attn.wo_a -> INT8 (vLLM 现有 o_proj 路径不支持)
     engram_wkv_mode: str = "bf16"  # bf16 | blockwise | int8
     mtp_experts: str = "int4"     # MTP routed experts: bf16 | int4 | int8
+    quantize_markov_head: bool = False  # 可选: mtp.*.markov_head.head -> INT8
+    quantize_lm_head: bool = False      # 可选: 顶层 head.weight (lm_head) -> INT8
 
 
 def resolve_engram_wkv_mode(int8_p3: bool, engram_wkv_mode: str | None) -> str:
@@ -569,6 +582,23 @@ def is_p3_indexer_weight(name: str) -> bool:
     return P3_INDEXER_RE.match(name) is not None
 
 
+def is_markov_head_weight(name: str) -> bool:
+    """可选 (--quantize-markov-head): mtp.{M}.markov_head.head.weight"""
+    return MARKOV_HEAD_RE.match(name) is not None
+
+
+def is_lm_head_weight(name: str) -> bool:
+    """可选 (--quantize-lm-head): 顶层 head.weight"""
+    return name == LM_HEAD_NAME
+
+
+def is_head_int8_target(name: str, opts: ConvOptions) -> bool:
+    """markov_head / lm_head 是否命中已启用的开关 (原始无 scale, 与 is_int8_target 分开)。"""
+    return (opts.quantize_markov_head and is_markov_head_weight(name)) or (
+        opts.quantize_lm_head and is_lm_head_weight(name)
+    )
+
+
 def is_int8_target(name: str, opts: ConvOptions) -> bool:
     """该 checkpoint 键是否属于某个已启用的 INT8 目标。"""
     if is_shared_expert_weight(name):
@@ -770,6 +800,26 @@ def convert_one_file(
                 stats["attn_wo_a_int8"] += 1
             continue
 
+        # 8b. markov_head.head / lm_head (head.weight): 原始 BF16 无 scale -> INT8 channelwise
+        #     (兼容万一带 .scale 的 FP8 来源: 先反量化)
+        if is_head_int8_target(name, opts) and tensor.ndim == 2:
+            if is_fp8_blockwise_to_bf16(name, tensor, state_dict):
+                weight_fp32 = dequant_fp8_blockwise(
+                    _to_dev(tensor), _to_dev(state_dict[scale_name])
+                )
+            elif tensor.dtype in (torch.bfloat16, torch.float16, torch.float32):
+                weight_fp32 = _to_dev(tensor).float()
+            else:
+                weight_fp32 = None
+            if weight_fp32 is not None:
+                q_int8, new_scale = quantize_int8_channelwise(weight_fp32)
+                new_state_dict[name] = _to_cpu(q_int8)
+                new_state_dict[f"{prefix}.weight_scale"] = _to_cpu(new_scale)
+                stats[
+                    "lm_head_int8" if is_lm_head_weight(name) else "markov_head_int8"
+                ] += 1
+                continue
+
         # 9. 其它 FP8 blockwise (MLA 未启用部分 / compressor / indexer.wk /
         #    weights_proj / MTP attn / main_proj) -> BF16
         if is_fp8_blockwise_to_bf16(name, tensor, state_dict):
@@ -800,6 +850,8 @@ _STATS_KEYS = (
     "attn_int8_p3",
     "indexer_wqb_int8",
     "attn_wo_a_int8",
+    "markov_head_int8",
+    "lm_head_int8",
     "engram_wkv_int8",
     "mtp_expert_int4",
     "mtp_expert_int8",
@@ -1088,17 +1140,20 @@ def build_ignore_list(opts: ConvOptions) -> list[str]:
 
         # ---- MTP 特殊模块 ----
         r"re:.*main_proj.*",
-        r"re:.*markov_head.*",
         r"re:.*confidence_head.*",
 
         # ---- 视觉 / aligner / 顶层 ----
         r"re:.*vision\..*",
         r"re:.*aligner\..*",
-        "lm_head",
-        "head",
         "embed",
         "norm",
     ]
+
+    # markov_head / lm_head 默认 BF16 (ignore); 对应开关开启时放行, 由独立 group 命中
+    if not opts.quantize_markov_head:
+        ignore.append(r"re:.*markov_head.*")
+    if not opts.quantize_lm_head:
+        ignore.extend(["lm_head", "head", r"re:(?:.*\.)?lm_head$"])
 
     # ---- (b) MTP / DSpark 子树 ----
     # sglang DSpark draft 把 MTP 挂在 `stages.{N}.mlp.*` 下, vLLM 用 `model.mtp.{N}.*`;
@@ -1125,7 +1180,6 @@ def build_ignore_list(opts: ConvOptions) -> list[str]:
         r"re:.*(?:mtp|stages)\.\d+\.(?:ffn|mlp)\.gate\..*",
         r"re:.*(?:mtp|stages)\.\d+\.(?:attn_norm|ffn_norm|main_norm|norm)$",
         r"re:.*(?:mtp|stages)\.\d+\.main_proj$",
-        r"re:.*(?:mtp|stages)\.\d+\.markov_head\..*",
         r"re:.*(?:mtp|stages)\.\d+\.confidence_head\..*",
         r"re:.*(?:mtp|stages)\.\d+\.hc_.*",
         r"re:.*(?:mtp|stages)\.\d+\.embed.*",
@@ -1133,10 +1187,17 @@ def build_ignore_list(opts: ConvOptions) -> list[str]:
         # 与 ENGRAM_WKV_RE 只放行 layers.* 保持一致
         r"re:.*(?:mtp|stages)\.\d+\.engram\..*",
     ])
+    if not opts.quantize_markov_head:
+        ignore.append(r"re:.*(?:mtp|stages)\.\d+\.markov_head\..*")
 
     if opts.mtp_experts == "bf16":
         # MTP routed experts 也保持 BF16: 直接整棵 MTP 子树 ignore。
         # targets 侧无需改动, 因为主 experts 的 target 已用负向先行断言排除 MTP。
+        if opts.quantize_markov_head:
+            raise ValueError(
+                "--quantize-markov-head 与 --mtp-experts bf16 冲突: "
+                "bf16 档位会 ignore 整棵 MTP 子树, markov_head 无法拿到 INT8 scheme"
+            )
         ignore.extend([
             r"re:.*stages\.\d+\..*",
             r"re:.*mtp\.\d+\..*",
@@ -1283,6 +1344,25 @@ def build_compression_config(opts: ConvOptions) -> dict:
             **int8_group_kwargs,
         }
 
+    # ---- 可选: markov_head.head / lm_head ----
+    # vLLM 运行时模块名 (vllm/models/deepseek_v41/nvidia):
+    #   lm_head     : language_model.lm_head   (VL 入口带 language_model. 前缀, 精确匹配 "lm_head" 命中不了)
+    #   markov_head : model.markov_head.markov_w2  (checkpoint 的 markov_head.head 在 dspark.py 被改名)
+    # sglang: lm_head 由 get_lm_head_scheme 按 re:/点分后缀匹配, 同一 target 可命中;
+    #   markov_w2 是无 quant_config 的 nn.Linear, 需 sglang patch 后才能加载 INT8。
+    # 不写裸 "head": 两个引擎都没有这个运行时模块名, 且 sglang 的点分后缀匹配
+    #   会误中 nextn 的 shared_head.head。
+    if opts.quantize_markov_head:
+        groups["group_int8_markov_head"] = {
+            "targets": [r"re:.*markov_head\.(?:markov_w2|head)$"],
+            **int8_group_kwargs,
+        }
+    if opts.quantize_lm_head:
+        groups["group_int8_lm_head"] = {
+            "targets": [r"re:(?:.*\.)?lm_head$"],
+            **int8_group_kwargs,
+        }
+
     return {
         "config_groups": groups,
         "format": "pack-quantized",
@@ -1417,6 +1497,10 @@ def write_summary(
         int8_targets.append("MLA 输入投影 (attn.wq_a / attn.wkv / attn.wq_b)")
     if opts.int8_wo_a:
         int8_targets.append("MLA 分组 O 投影 (attn.wo_a, 需引擎自带 INT8 BMM kernel)")
+    if opts.quantize_markov_head:
+        int8_targets.append("MTP markov_head.head (需引擎 patch 支持)")
+    if opts.quantize_lm_head:
+        int8_targets.append("lm_head (head.weight, 需引擎 patch 支持)")
     if opts.int8_p3:
         int8_targets.append("MLA 输出投影 (attn.wo_b)")
         int8_targets.append("DSA indexer (attn.indexer.wq_b)")
@@ -1430,6 +1514,8 @@ def write_summary(
         "priority_2_enabled": opts.int8_p2,
         "priority_3_enabled": opts.int8_p3,
         "int8_wo_a_enabled": opts.int8_wo_a,
+        "quantize_markov_head": opts.quantize_markov_head,
+        "quantize_lm_head": opts.quantize_lm_head,
         "mode": opts.mode,
         "group_size": opts.group_size,
         "engram_wkv_mode": opts.engram_wkv_mode,
@@ -1604,6 +1690,8 @@ def _self_check_mtp_ignore(opts: ConvOptions) -> None:
         "{p}confidence_head.proj",
         "{p}engram.wkv",                        # MTP 的 engram 不参与 INT8
     ]
+    if opts.quantize_markov_head:
+        must_ignore.remove("{p}markov_head.head")
     for prefix in ("model.mtp.0.", "stages.0."):
         for tmpl in must_ignore:
             name = tmpl.format(p=prefix)
@@ -1654,6 +1742,40 @@ def _self_check_mtp_ignore(opts: ConvOptions) -> None:
                     f"--mtp-experts {opts.mtp_experts} 但 {name} 被 ignore -> 写了 "
                     f"{opts.mtp_experts} 却拿不到对应 scheme, 加载时会 dtype 不匹配"
                 )
+
+
+def _self_check_heads(opts: ConvOptions) -> None:
+    """静态检查: markov_head / lm_head 的 ignore / target 与开关一致, 且写侧谓词一致。"""
+    ignore = build_ignore_list(opts)
+    cfg = build_compression_config(opts)
+    targets = [t for g in cfg["config_groups"].values() for t in g["targets"]]
+
+    def _match(patterns: list[str], value: str) -> bool:
+        return any(
+            re.match(p[3:], value) if p.startswith("re:") else p == value
+            for p in patterns
+        )
+
+    cases = [
+        ("lm_head", opts.quantize_lm_head),
+        ("language_model.lm_head", opts.quantize_lm_head),
+        ("model.mtp.0.markov_head.head", opts.quantize_markov_head),
+        ("stages.0.markov_head.head", opts.quantize_markov_head),
+        ("model.markov_head.markov_w2", opts.quantize_markov_head),
+    ]
+    for name, quantized in cases:
+        assert _match(ignore, name) != quantized, (
+            f"{name}: quantized={quantized} 但 ignored={_match(ignore, name)}"
+        )
+        assert _match(targets, name) == quantized, (
+            f"{name}: quantized={quantized} 但 target 命中={_match(targets, name)}"
+        )
+
+    assert not _match(targets, "model.layers.43.shared_head.head"), (
+        "shared_head.head 不应被任何 INT8 target 命中"
+    )
+    assert is_head_int8_target("head.weight", opts) == opts.quantize_lm_head
+    assert is_head_int8_target("mtp.0.markov_head.head.weight", opts) == opts.quantize_markov_head
 
 
 def _draft_runtime_layers(model_dir: str) -> list[int]:
@@ -1837,8 +1959,10 @@ def main() -> None:
             "--int8-p2/--int8-p3. Default: off (wo_a stays BF16). WARNING: stock "
             "vLLM cannot run the result: wo_a is_bmm=True and its o_proj path "
             "(deep_gemm_fp8_o_proj) only implements fp8/bf16 branches, so an "
-            "INT8 wo_a fails at the first forward (profile_run). Enable only if "
-            "your engine provides a grouped INT8 BMM kernel for wo_a."
+            "INT8 wo_a fails at the first forward (profile_run). Enable only "
+            "with a vLLM patch that dequantizes wo_a to BF16 after loading "
+            "(_DequantInt8WoAMethod in deepseek_v41/attention.py), or an "
+            "engine with a grouped INT8 BMM kernel for wo_a."
         ),
     )
     parser.add_argument(
@@ -1869,6 +1993,30 @@ def main() -> None:
             "Draft precision drives the speculative-decoding acceptance rate, so "
             "raise this only if measured acceptance regresses at int4. "
             "int4 shares --group-size with the backbone experts."
+        ),
+    )
+    parser.add_argument(
+        "--quantize-markov-head",
+        action="store_true",
+        default=False,
+        help=(
+            "Quantize mtp.*.markov_head.head (original BF16, no scale) to INT8 "
+            "channelwise, as its own config group. Default: off (stays BF16). "
+            "Requires the engine (patched) to load INT8 weights for this layer: "
+            "vLLM needs the DSpark markov head patch; sglang's markov_w2 is a plain "
+            "nn.Linear and also needs a patch. "
+            "Conflicts with --mtp-experts bf16."
+        ),
+    )
+    parser.add_argument(
+        "--quantize-lm-head",
+        action="store_true",
+        default=False,
+        help=(
+            "Quantize top-level head.weight (lm_head, original BF16, no scale) to "
+            "INT8 channelwise, as its own config group. Default: off (stays BF16). "
+            "Quantization error hits logits directly, and the DSpark draft shares "
+            "this weight; requires the engine (patched) to support it."
         ),
     )
     parser.add_argument(
@@ -1919,11 +2067,14 @@ def main() -> None:
         int8_wo_a=args.int8_wo_a,
         engram_wkv_mode=engram_wkv_mode,
         mtp_experts=args.mtp_experts,
+        quantize_markov_head=args.quantize_markov_head,
+        quantize_lm_head=args.quantize_lm_head,
     )
 
     torch.set_num_threads(args.num_threads)
     _self_check_pack()
     _self_check_int8()
+    _self_check_heads(opts)
     _self_check_ignore_partial(opts, args.input_dir)
     _self_check_mtp_ignore(opts)
     _self_check_draft_runtime_names(opts, args.input_dir)
@@ -1940,9 +2091,12 @@ def main() -> None:
     print(f"  priority 3        : {'ON ' if opts.int8_p3 else 'off'} (attn.wo_b, indexer.wq_b -> INT8)")
     print(f"  int8 wo_a         : {'ON ' if opts.int8_wo_a else 'off'} (attn.wo_a -> INT8; off = BF16)")
     if opts.int8_wo_a:
-        print("  !! WARNING: --int8-wo-a 产物需要引擎自带 wo_a INT8 BMM kernel, "
-              "未打补丁的 vLLM 会在首次前向崩溃 (见脚本顶部说明)")
+        print("  !! WARNING: --int8-wo-a 产物需要 vLLM 的 wo_a 运行时 dequant patch "
+              "(或引擎自带 INT8 BMM kernel), 未打补丁的 vLLM 会在首次前向崩溃 "
+              "(见脚本顶部说明)")
     print(f"  engram_wkv_mode   : {opts.engram_wkv_mode}")
+    print(f"  markov_head INT8  : {'ON ' if opts.quantize_markov_head else 'off'} (mtp.*.markov_head.head)")
+    print(f"  lm_head INT8      : {'ON ' if opts.quantize_lm_head else 'off'} (head.weight)")
     print(
         f"  mtp_experts       : {opts.mtp_experts}"
         f"{'  (原 MXFP4 -> 同档位 INT4)' if opts.mtp_experts == 'int4' else ''}"
