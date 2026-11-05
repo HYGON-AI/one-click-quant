@@ -37,6 +37,7 @@ def get_reference_converter():
 class Step5Adapter(ModelAdapter):
     name = "step5"
     load_only_required_tensors = True
+    supports_mtp_int4 = True
     _routed_expert_pattern = re.compile(r"(?:^|\.)moe\.experts\.\d+\.(?:gate|up|down)_proj(?:\.|$)")
 
     @classmethod
@@ -57,17 +58,49 @@ class Step5Adapter(ModelAdapter):
         self.plan, self.consumed_scales = converter.build_plan(raw, self.meta)
         self.moe_layers = set(self.text["moe_layer_list"])
         self.num_experts = int(self.text["moe_num_experts"])
-        self.layer_bits = {
-            item.output.removesuffix(".weight"): 4 for item in self.plan if item.int4
-        }
+        self.layer_bits = {item.output.removesuffix(".weight"): 4 for item in self.plan if item.int4}
+        backbone = re.compile(
+            r"^model\.layers\.(\d+)\."
+            r"(?:self_attn\.(?:q|k|v|o|g)_proj|"
+            r"(?:mlp|share_expert)\.(?:gate|up|down)_proj)\.weight$"
+        )
+        for name, (dtype, shape) in self.meta.items():
+            match = backbone.fullmatch(name)
+            if match and int(match[1]) < int(self.text["num_hidden_layers"]):
+                if len(shape) != 2 or shape[1] % 8:
+                    raise ValueError(f"Unsupported Step5 INT4 backbone shape: {name}: {shape}")
+                self.layer_bits[name.removesuffix(".weight")] = 4
+        if "lm_head.weight" not in self.meta:
+            raise ValueError("Step5 checkpoint is missing lm_head.weight")
+        if len(self.meta["lm_head.weight"][1]) != 2 or self.meta["lm_head.weight"][1][1] % 8:
+            raise ValueError("Step5 lm_head must be a 2D INT4-compatible matrix")
+        self.layer_bits["lm_head"] = 4
+        self.mtp_names = set()
+        start = int(self.text["num_hidden_layers"])
+        end = start + int(self.text.get("num_nextn_predict_layers", 0))
+        mtp = re.compile(
+            r"^model\.layers\.(\d+)\.(?:"
+            r"self_attn\.(?:q|k|v|o|g)_proj|"
+            r"mlp\.(?:gate|up|down)_proj|"
+            r"transformer\.shared_head\.output)\.weight$"
+        )
+        for name, (_, shape) in self.meta.items():
+            match = mtp.fullmatch(name)
+            if match and start <= int(match[1]) < end:
+                if len(shape) != 2 or shape[1] % 8:
+                    raise ValueError(f"Unsupported Step5 MTP INT4 shape: {name}: {shape}")
+                self.mtp_names.add(name.removesuffix(".weight"))
+        if end > start and not self.mtp_names:
+            raise ValueError("Step5 MTP layers configured but no quantizable MTP weights found")
         self._manifest = {
-            "version": 1,
+            "version": 2,
             "source_config_sha256": _digest(raw),
             "source_weight_map_sha256": _digest(self.weight_map),
             "source_tensor_metadata_sha256": _digest(self.meta),
             "backbone_algorithm": "gptq",
-            "mtp_algorithm": "copy",
+            "mtp_algorithm": "rtn_int4",
             "quantized_layers": sorted(self.layer_bits),
+            "mtp_layers": sorted(self.mtp_names),
         }
 
     def prepare_config(self, config, world_size: int) -> None:
@@ -151,15 +184,29 @@ class Step5Adapter(ModelAdapter):
         return list(self.raw_config["quantization_config"]["ignore"])
 
     def resolve_ignore(self, ignore=None, quantize_only_experts=False, force_int8=None):
-        del quantize_only_experts
+        if quantize_only_experts:
+            raise ValueError("Step5 full INT4 recipe does not support --quantize_only_experts.")
         if force_int8:
-            raise ValueError("Step5 source scope does not support --force_int8.")
-        rules = self.default_ignore_rules()
+            raise ValueError("Step5 full INT4 recipe does not support --force_int8.")
+        rules = [
+            rule for rule in self.default_ignore_rules()
+            if rule not in (
+                r"re:.*lm_head$",
+                r"re:.*model\.layers\.\d+\.self_attn\..*",
+                r"re:.*model\.layers\.\d+\.mlp\..*",
+                r"re:.*model\.layers\.\d+\.share_expert\..*",
+            )
+        ]
+        # MTP bypasses GPTQ. Its checkpoint weights are handled during packing.
+        if self.mtp_names:
+            start = int(self.text["num_hidden_layers"])
+            end = start + int(self.text.get("num_nextn_predict_layers", 0))
+            rules.append(
+                rf"re:^model\.layers\.(?:{'|'.join(map(str, range(start, end)))})\."
+            )
         if ignore:
-            # The source recipe is part of the checkpoint contract. Permit an
-            # exact replay but reject accidental scope changes.
             if sorted(ignore) != sorted(rules):
-                raise ValueError("Step5 uses the source checkpoint's fixed 12 ignore rules.")
+                raise ValueError("Step5 full INT4 recipe uses a fixed ignore scope.")
         return rules
 
     def resolve_layer_bits(self, layer_name, default_bits, force_int8=None):
@@ -218,8 +265,8 @@ class Step5Adapter(ModelAdapter):
     def validate_packing_args(self, args):
         if args.bits != 4 or args.group_size is not None or args.dtype != "bfloat16" or args.activation_bits != 8:
             raise ValueError("Step5 packing requires channel W4A8 with --dtype bfloat16.")
-        if args.mtp_int8 or args.mtp_int4:
-            raise ValueError("Step5 preserves the source MTP weights.")
+        if args.mtp_int8 or (self.mtp_names and not args.mtp_int4):
+            raise ValueError("Step5 MTP requires --mtp-int4 (INT4 RTN) and does not support --mtp-int8.")
 
     def quantization_metadata(self):
         result = {"step5_source_manifest": copy.deepcopy(self._manifest)}

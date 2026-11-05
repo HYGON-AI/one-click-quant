@@ -24,7 +24,7 @@ def expected_schema(adapter):
     for item in adapter.plan:
         dtype, source_shape = adapter.meta[item.source]
         shape = source_shape[1:] if item.expert is not None else source_shape
-        if item.int4:
+        if item.output.removesuffix(".weight") in adapter.layer_bits or item.output.removesuffix(".weight") in adapter.mtp_names:
             module = item.output.removesuffix(".weight")
             result[module + ".weight_packed"] = ("I32", (shape[0], shape[1] // 8))
             result[module + ".weight_scale"] = ("F32", (shape[0], 1))
@@ -33,6 +33,43 @@ def expected_schema(adapter):
             if dtype in get_reference_converter().FP8:
                 dtype = "BF16"
             result[item.output] = (dtype, tuple(shape))
+    return result
+
+
+def compression_config(adapter):
+    converter = get_reference_converter()
+    result = copy.deepcopy(adapter.raw_config["quantization_config"])
+    group = converter.compression_config(adapter.raw_config, adapter.plan)["config_groups"]["group_w4a8"]
+    expert_targets = list(group["targets"])
+    expert_names = {item.output.removesuffix(".weight") for item in adapter.plan if item.int4}
+    targets = sorted((set(adapter.layer_bits) - expert_names) | adapter.mtp_names)
+    # Runtime fuses q/k/v and gate/up, and renames the MTP prediction head.
+    runtime = [
+        r"re:.*model\.layers\.\d+\.(?:mtp_block\.)?self_attn\.(?:qkv_proj|qkvg_proj)$",
+        r"re:.*model\.layers\.\d+\.(?:mtp_block\.)?(?:mlp|share_expert)\.gate_up_proj$",
+        r"re:.*model\.layers\.\d+\.moe\.share_expert\.(?:gate_up_proj|down_proj)$",
+        r"re:.*model\.layers\.\d+\.shared_head\.head$",
+    ]
+    group["targets"] = expert_targets + targets + runtime
+    result["config_groups"] = {"group_w4a8": group}
+    result.update(format="pack-quantized", quantization_status="compressed",
+                  global_compression_ratio=None)
+    # Exact targets avoid inadvertently quantizing routers, norms, ViT or eh_proj.
+    result["ignore"] = [
+        rule for rule in result.get("ignore", [])
+        if rule not in (
+            r"re:.*lm_head$",
+            r"re:.*model\.layers\.\d+\.self_attn\..*",
+            r"re:.*model\.layers\.\d+\.mlp\..*",
+            r"re:.*model\.layers\.\d+\.share_expert\..*",
+            r"re:.*model\.layers\.\d+\.transformer\..*",
+        )
+    ]
+    for item in adapter.plan:
+        module = item.output.removesuffix(".weight")
+        selected = converter.matches(module, group["targets"]) and not converter.matches(module, result["ignore"])
+        if selected != (module in adapter.layer_bits or module in adapter.mtp_names):
+            raise ValueError(f"Step5 config targets disagree with output: {module}")
     return result
 
 
@@ -55,6 +92,27 @@ def pack_artifact(path, module, shape):
         module + ".weight_packed": packed,
         module + ".weight_scale": scales.float().contiguous(),
         module + ".weight_shape": torch.tensor(shape, dtype=torch.int64),
+    }
+
+
+def pack_rtn(value, module, fp8_scale=None):
+    converter = get_reference_converter()
+    if value.ndim != 2 or value.shape[1] % 8:
+        raise ValueError(f"Step5 MTP INT4 requires [N, K] with K divisible by 8: {module}")
+    packed = torch.empty((value.shape[0], value.shape[1] // 8), dtype=torch.int32)
+    scale = torch.empty((value.shape[0], 1), dtype=torch.float32)
+    for begin in range(0, value.shape[0], 256):
+        end = min(begin + 256, value.shape[0])
+        block = value[begin:end]
+        if fp8_scale is not None:
+            block = block.float() * fp8_scale[begin:end].float().reshape(-1, 1)
+        codes, scales, _ = converter.quantize_int4(block)
+        packed[begin:end] = codes.cpu()
+        scale[begin:end] = scales.cpu()
+    return {
+        module + ".weight_packed": packed,
+        module + ".weight_scale": scale,
+        module + ".weight_shape": torch.tensor(value.shape, dtype=torch.int64),
     }
 
 
@@ -106,14 +164,22 @@ def pack_checkpoint(adapter, args, metadata=None):
             return handle.get_tensor(name) if expert is None else handle.get_slice(name)[expert]
 
         for i, item in enumerate(adapter.plan, 1):
-            if item.int4:
-                module = item.output.removesuffix(".weight")
+            module = item.output.removesuffix(".weight")
+            if module in adapter.layer_bits:
                 _, shape = adapter.meta[item.source]
                 shape = shape[1:] if item.expert is not None else shape
                 output = pack_artifact(intermediate / module / "quantized_weight.pt", module, shape)
                 for key, value in output.items():
                     writer.add(key, value)
                 counts["gptq_int4_matrices"] += 1
+            elif module in adapter.mtp_names:
+                value = read(item.source, item.expert)
+                scale = None
+                if adapter.meta[item.source][0] in converter.FP8:
+                    scale = read(item.source.removesuffix(".weight") + ".weight_scale", item.expert)
+                for key, tensor in pack_rtn(value, module, fp8_scale=scale).items():
+                    writer.add(key, tensor)
+                counts["mtp_rtn_int4_matrices"] += 1
             else:
                 value = read(item.source, item.expert)
                 if adapter.meta[item.source][0] in converter.FP8:
@@ -132,7 +198,7 @@ def pack_checkpoint(adapter, args, metadata=None):
         ))):
             shutil.copy2(path, target / path.name)
     config = copy.deepcopy(adapter.raw_config)
-    config["quantization_config"] = converter.compression_config(config, adapter.plan)
+    config["quantization_config"] = compression_config(adapter)
     (target / "moe_quant_provenance.json").write_text(json.dumps({
         **adapter.quantization_metadata(), "counts": dict(counts),
         "step5_calibration": (metadata or {}).get("step5_calibration"),

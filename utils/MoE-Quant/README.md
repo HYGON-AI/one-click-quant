@@ -139,6 +139,27 @@ python pack_quantized_model.py \
     --dtype bfloat16
 ```
 
+### Step5 全主干 INT4 W4A8
+
+`tests/run_step5_w4a8_gptq.sh` 使用独立的 `step-5-preview-full-int4-GPTQ*`
+目录：主干路由专家、attention 的 q/k/v/o/g 投影、普通/共享 MLP 及
+`lm_head` 均使用 channel INT4 GPTQ；MTP attention、MLP 和
+`transformer.shared_head.output` 使用 channel INT4 RTN（`--mtp-int4`）。
+router、norm、embedding、视觉模块及 MTP `eh_proj` 保持原精度。
+`lm_head` 的 Hessian 从校准序列的最终 norm 输出收集；MTP 不参与主干校准。
+旧版仅专家的中间产物不能用 `--pack-only` 复用，新版元数据会拒绝它。
+
+**当前 vLLM Step5 runtime 不支持直接加载这一新产物**：其 attention、
+共享 MLP 和 `lm_head` 构造函数传入了 `quant_config=None`，需要先完成
+运行时量化层与融合权重加载适配，并做实际启动/输出测试。因此脚本默认只量化、
+打包和校验；`SERVE_AFTER_PACK=1` 仅用于已完成运行时适配的环境。
+`step-5_zyq` 容器没有挂载脚本默认的 `/DL_DATA`、`/quant_models`，运行前须
+指定容器内可见的 `MODEL_PATH`、`DATASET`、输出路径及其可写挂载。
+
+CPU 合同检查：`PYTHONDONTWRITEBYTECODE=1 python tests/test_step5_full_int4.py`。
+完整的变更范围、数据流、运行与验证说明见
+[STEP5_FULL_INT4_W4A8_ZH.md](./STEP5_FULL_INT4_W4A8_ZH.md)。
+
 ### 已支持模型
 - DeepSeek-V3 (DeepseekV3ForCausalLM)
 - Qwen3.8-2.4T-A95B-FP8 (Qwen3_5MoeForCausalLM)

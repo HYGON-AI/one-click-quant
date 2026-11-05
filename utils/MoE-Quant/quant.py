@@ -544,6 +544,41 @@ def quantize_expert_handle(handle_name, handle, args, bits):
     return message, handle.issue_zero_samples, handle.issue_nan_hessian, handle.issue_non_invertible
 
 
+def quantize_step5_head(args, runtime, model_context, calibration, checkpoint):
+    adapter = model_context.adapter
+    if adapter.name != "step5" or "lm_head" not in adapter.layer_bits:
+        return
+    from safetensors import safe_open
+
+    def read(name):
+        with safe_open(
+            os.path.join(checkpoint.weight_dir, adapter.weight_map[name]),
+            framework="pt", device="cpu",
+        ) as source:
+            return source.get_tensor(name)
+
+    norm = model_context.model.model.norm.to_empty(device=runtime.device)
+    norm.weight.data = read("model.norm.weight").to(runtime.device, dtype=torch.float32)
+    head = model_context.model.lm_head.to_empty(device=runtime.device)
+    weight = read("lm_head.weight")
+    if weight.dtype in quant_utils.FP8_DTYPES:
+        scale = read("lm_head.weight_scale")
+        weight = (weight.float() * scale.float().reshape(-1, 1)).to(runtime.dtype)
+    head.weight.data = weight.to(runtime.device, dtype=runtime.dtype)
+    del weight
+    handle = gptq.GPTQ(
+        head, args.group_size, args.sym, args.rel_damp, args.block_size,
+        args.quantization_order, args.quantization_scale, is_distributed=True,
+    )
+    for states in calibration.inputs:
+        handle.update(norm(states.to(runtime.device)).to(head.weight.dtype))
+    dist_utils.print_on_main("Quantizing lm_head (bits=4)")
+    quantize_shared_handle("lm_head", handle, args, 4)
+    head.to(device="meta")
+    norm.to(device="meta")
+    torch.cuda.empty_cache()
+
+
 def process(args, runtime=None, model_context=None, calibration=None, checkpoint=None):
     if runtime is None:
         runtime = initialize_runtime(args)
@@ -691,6 +726,7 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
         release(block, prefix, checkpoint, runtime)
 
+    quantize_step5_head(args, runtime, model_context, calibration, checkpoint)
     dist_utils.barrier(device_ids=[rank])
     save_quantization_metadata(args, ignore_rules, adapter)
     cleanup_runtime()

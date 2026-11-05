@@ -10,9 +10,8 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models import get_model_adapter
-from src.models.step5_checkpoint import expected_schema, validate_schema
+from src.models.step5_checkpoint import compression_config, expected_schema, validate_schema
 from src.models.step5_utils import Step5DecoderLayer
-from src.models.step5_adapter import get_reference_converter
 
 
 def main():
@@ -41,7 +40,14 @@ def main():
             count += 1
         del block
     assert len(adapter.default_ignore_rules()) == 12
-    print(f"Step5 source OK: {count} logical decoder tensors; {len(adapter.layer_bits)} GPTQ targets; original 12 ignore rules", flush=True)
+    assert "lm_head" in adapter.layer_bits
+    for name in adapter.layer_bits:
+        if name == "lm_head":
+            continue
+        physical = adapter.checkpoint_keys_for_model_key(name + ".weight", adapter.weight_map)[0]
+        if physical not in adapter.meta:
+            raise ValueError(f"Missing GPTQ source: {name}")
+    print(f"Step5 source OK: {count} logical decoder tensors; {len(adapter.layer_bits)} GPTQ targets; {len(adapter.mtp_names)} MTP RTN targets", flush=True)
     if args.packed:
         root = Path(args.packed)
         if (root / ".incomplete").exists():
@@ -50,9 +56,7 @@ def main():
         validate_schema(root, index["weight_map"], expected_schema(adapter))
         saved = json.loads((root / "config.json").read_text())
         expected_config = adapter.raw_config.copy()
-        expected_config["quantization_config"] = get_reference_converter().compression_config(
-            adapter.raw_config, adapter.plan
-        )
+        expected_config["quantization_config"] = compression_config(adapter)
         if saved != expected_config:
             raise ValueError("Packed Step5 config differs from the source-preserving GPTQ recipe")
         print(f"Step5 packed output OK: {root}; {len(index['weight_map'])} tensors", flush=True)
