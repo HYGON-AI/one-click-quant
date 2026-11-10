@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Export Smooth INT8 DSpark from native weights and saved calibration activations."""
 
+# Reuse saved rank activations or collect them with a BF16 DSpark draft.
+# Fit channel-wise smoothing scales on sampled activations and native weights.
+# Fold them into RMSNorm and the corresponding weight columns before exporting
+# per-channel INT8 with dynamic per-token INT8 activations. Folded norms remain
+# BF16. The local quantization_report.json records the calibration inputs and
+# selected fold settings.
+
 import argparse
 import hashlib
 from contextlib import ExitStack

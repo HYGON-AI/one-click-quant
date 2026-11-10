@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Export MiniMax M3.1 native NVFP4/MXFP8 weights without loading the model."""
 
+# Reconstruct native NVFP4 and MXFP8 matrices in FP32 from their stored scales.
+# W4A8 uses per-channel packed INT4 for experts and per-channel INT8 for other
+# quantized linears. The INT4 weight-MSE search and integer rounding use FP64.
+# SlimQuant applies dynamic per-token INT8 activations at runtime.
+#
+# DSpark FP8 and direct INT8 export per-channel E4M3FN and INT8 weights with
+# compressed-tensors metadata for dynamic per-token activations. The BF16
+# recipe materializes a draft for Smooth INT8 calibration.
+#
+# Each export processes one shard at a time and preserves unquantized tensors.
+# Use sufficient RAM for an output shard and disk for the exported checkpoint.
+# The main W4A8 export and the draft exports are separate checkpoints. Use
+# --device cpu for CPU conversion or --device cuda:0 for accelerator conversion.
+
 import argparse
 import json
 import shutil

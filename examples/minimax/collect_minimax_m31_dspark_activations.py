@@ -2,6 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Collect calibration activations from an isolated MiniMax M3.1 server."""
 
+# Install aiohttp, pyarrow and transformers in the client environment.
+# Start an isolated SGLang server with the W4A8 target, the exported BF16 draft
+# and --speculative-algorithm DSPARK. Pass the BF16 draft via
+# --speculative-draft-model-path and set --cuda-graph-backend-prefill disabled
+# and --cuda-graph-backend-decode disabled. Use --url if the server listens
+# somewhere other than http://127.0.0.1:11010.
+#
+# In the launcher, prepend the absolute dspark_calibration directory to
+# PYTHONPATH after assigning the runtime paths. Set M31_CALIB_OUTPUT to the
+# client's --output directory. The server and client must share this directory.
+#
+# The reference server used DP8/EP8, context length 163840, chunk size 4096,
+# max total tokens 524288 and static memory fraction 0.90. The client routes
+# 128 WikiText training pages across DP ranks and saves the activation files
+# and calibration_manifest.json for the Smooth INT8 exporter.
+
 import argparse
 import asyncio
 import hashlib
