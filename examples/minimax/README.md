@@ -11,6 +11,50 @@ python3 main.py --model /models/MiniMax-M2.5 --scheme FP8_TO_BF16 --save-dir /mo
 python main.py --model /models/MiniMax-M2.5-BF16 --scheme W8A8 --alg ptq --needs-data false --ignore 'lm_head,re:.*moe.gate+,re:.*moe.e_score_correction_bias+' --save-dir /models/MiniMax-M2.5-W8A8
 ```
 
+### MiniMax M3.1 Flash native quantization
+
+Run from `examples/minimax` with Python 3.10+, PyTorch with FP8 support and `safetensors`. Use fresh output directories.
+
+```bash
+src=/models/MiniMax-M3.1-Flash
+out=/models/m31-exports
+
+# Main W4A8
+python quantize_minimax_m31_native.py --source "$src" \
+  --recipe w4a8 --device cuda:0 --output "$out/main-w4a8"
+
+# DSpark FP8 or direct INT8
+python quantize_minimax_m31_native.py --source "$src/dspark" \
+  --recipe dspark-fp8 --output "$out/dspark-fp8"
+
+python quantize_minimax_m31_native.py --source "$src/dspark" \
+  --recipe dspark-int8 --output "$out/dspark-int8-direct"
+```
+
+#### DSpark Smooth INT8
+
+For fresh calibration, export the BF16 draft, follow the [server setup](collect_minimax_m31_dspark_activations.py) and run the collector. With saved calibration files, skip to the Smooth INT8 export.
+
+```bash
+acts="$out/dspark-activations"
+
+python quantize_minimax_m31_native.py --source "$src/dspark" \
+  --recipe dspark-bf16 --output "$out/dspark-bf16-calibration"
+
+# Start the calibration server before running the collector.
+python collect_minimax_m31_dspark_activations.py \
+  --dataset /datasets/wikitext_document_level-train.arrow \
+  --tokenizer "$src" --output "$acts"
+
+python quantize_minimax_m31_dspark_smooth.py \
+  --source "$src/dspark" --activations "$acts" \
+  --calibration-manifest "$acts/calibration_manifest.json" \
+  --output "$out/dspark-int8-smooth"
+```
+
+Pass the exported draft to SGLang with `--speculative-draft-model-path`.
+
+
 ### MiniMax-M3.1 NVFP4 → channel FP8 转换验证
 
 依赖：`torch`、`safetensors`、`compressed-tensors`（已验证版本分别为
