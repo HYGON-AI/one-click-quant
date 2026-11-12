@@ -42,10 +42,18 @@ def expected_schema(adapter):
 
 def compression_config(adapter):
     converter = get_reference_converter()
+    if adapter.quantize_only_experts:
+        # Experts-only: nothing outside the routed expert banks is quantized, so
+        # the converter's single W4A8 group already is the whole recipe and the
+        # source ignore list is kept as-is.
+        result = converter.compression_config(adapter.raw_config, adapter.plan)
+        _verify_precision(result, adapter, converter, [result["config_groups"]["group_w4a8"]])
+        return result
+
     result = copy.deepcopy(adapter.raw_config["quantization_config"])
     group4 = converter.compression_config(adapter.raw_config, adapter.plan)["config_groups"]["group_w4a8"]
     expert_names = {item.output.removesuffix(".weight") for item in adapter.plan if item.int4}
-    int8_names = sorted((set(adapter.layer_bits) - expert_names) | adapter.mtp_names)
+    int8_names = sorted(set(adapter.layer_bits) - expert_names)
     # Runtime fuses q/k/v and gate/up, and renames the MTP prediction head.
     runtime = [
         r"re:.*model\.layers\.\d+\.(?:mtp_block\.)?self_attn\.(?:qkv_proj|qkvg_proj)$",
@@ -54,7 +62,7 @@ def compression_config(adapter):
         r"re:.*model\.layers\.\d+\.shared_head\.head$",
     ]
     group8 = {
-        "targets": int8_names + runtime,
+        "targets": int8_names + sorted(adapter.mtp_names) + runtime,
         "format": "int-quantized",
         "weights": dict(num_bits=8, type="int", strategy="channel", symmetric=True,
                         dynamic=False, group_size=None, observer="minmax"),
@@ -76,18 +84,23 @@ def compression_config(adapter):
             r"re:.*model\.layers\.\d+\.transformer\..*",
         )
     ]
+    _verify_precision(result, adapter, converter, [group4, group8])
+    return result
+
+
+def _verify_precision(result, adapter, converter, groups):
+    """Every planned tensor must be selected by exactly the group matching its bits."""
     for item in adapter.plan:
         module = item.output.removesuffix(".weight")
-        in_int4 = converter.matches(module, group4["targets"])
-        in_int8 = converter.matches(module, group8["targets"])
-        if in_int4 and in_int8:
-            raise ValueError(f"Step5 INT4/INT8 targets overlap: {module}")
-        ignored = converter.matches(module, result["ignore"])
-        selected_bits = 4 if (in_int4 and not ignored) else 8 if (in_int8 and not ignored) else None
+        ignored = converter.matches(module, result.get("ignore", []))
+        hits = [g for g in groups if converter.matches(module, g["targets"])]
+        selected_bits = None if ignored else (hits[0]["weights"]["num_bits"] if hits else None)
         expected_bits = adapter.layer_bits.get(module, 8 if module in adapter.mtp_names else None)
         if selected_bits != expected_bits:
-            raise ValueError(f"Step5 config targets disagree with output: {module}")
-    return result
+            raise ValueError(
+                f"Step5 config targets disagree with output: {module} "
+                f"(selected={selected_bits}, planned={expected_bits}, groups_matched={len(hits)})"
+            )
 
 
 def pack_artifact(path, module, shape, bits):
@@ -175,7 +188,10 @@ def pack_checkpoint(adapter, args, metadata=None):
     if int(args.max_shard_size_mb) <= 0:
         raise ValueError("Step5 max shard size must be positive.")
     actual = {path.parent.name for path in intermediate.glob("*/quantized_weight.pt")}
-    wanted = set(adapter.layer_bits)
+    # RTN-packed modules are read from the source checkpoint, so a GPTQ artifact
+    # for them (lm_head still goes through GPTQ) is ignored rather than required.
+    wanted = set(adapter.layer_bits) - adapter.rtn_int8_names
+    actual -= adapter.rtn_int8_names
     if actual != wanted:
         raise ValueError(f"Step5 GPTQ artifacts mismatch: missing={len(wanted-actual)}, extra={len(actual-wanted)}")
     target.mkdir(parents=True, exist_ok=True)
@@ -196,7 +212,16 @@ def pack_checkpoint(adapter, args, metadata=None):
 
         for i, item in enumerate(adapter.plan, 1):
             module = item.output.removesuffix(".weight")
-            if module in adapter.layer_bits:
+            if module in adapter.rtn_int8_names:
+                value = read(item.source, item.expert)
+                scale = None
+                if adapter.meta[item.source][0] in converter.FP8:
+                    scale = read(item.source.removesuffix(".weight") + ".weight_scale", item.expert)
+                for key, tensor in pack_rtn_int8(value, module, fp8_scale=scale).items():
+                    writer.add(key, tensor)
+                counts["mtp_rtn_int8_matrices" if module in adapter.mtp_names
+                       else "rtn_int8_matrices"] += 1
+            elif module in adapter.layer_bits:
                 bits = adapter.layer_bits[module]
                 _, shape = adapter.meta[item.source]
                 shape = shape[1:] if item.expert is not None else shape
@@ -204,14 +229,6 @@ def pack_checkpoint(adapter, args, metadata=None):
                 for key, value in output.items():
                     writer.add(key, value)
                 counts[f"gptq_int{bits}_matrices"] += 1
-            elif module in adapter.mtp_names:
-                value = read(item.source, item.expert)
-                scale = None
-                if adapter.meta[item.source][0] in converter.FP8:
-                    scale = read(item.source.removesuffix(".weight") + ".weight_scale", item.expert)
-                for key, tensor in pack_rtn_int8(value, module, fp8_scale=scale).items():
-                    writer.add(key, tensor)
-                counts["mtp_rtn_int8_matrices"] += 1
             else:
                 value = read(item.source, item.expert)
                 if adapter.meta[item.source][0] in converter.FP8:

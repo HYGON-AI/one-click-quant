@@ -18,9 +18,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
     parser.add_argument("--packed")
+    parser.add_argument(
+        "--quantize-only-experts",
+        action="store_true",
+        help="Verify the experts-only recipe instead of the mixed INT4/INT8 one.",
+    )
     args = parser.parse_args()
     config = AutoConfig.from_pretrained(args.source, trust_remote_code=True)
     adapter = get_model_adapter(config)
+    adapter.resolve_ignore(None, quantize_only_experts=args.quantize_only_experts)
     # Check every decoder's logical/source shape mapping without materializing
     # the multi-hundred-billion-parameter model or reading tensor payloads.
     count = 0
@@ -40,7 +46,12 @@ def main():
             count += 1
         del block
     assert len(adapter.default_ignore_rules()) == 12
-    assert "lm_head" in adapter.layer_bits
+    if args.quantize_only_experts:
+        # Experts-only leaves lm_head and MTP at source precision.
+        assert "lm_head" not in adapter.layer_bits
+        assert not adapter.mtp_names
+    else:
+        assert "lm_head" in adapter.layer_bits
     for name in adapter.layer_bits:
         if name == "lm_head":
             continue

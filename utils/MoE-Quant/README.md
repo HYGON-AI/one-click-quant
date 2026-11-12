@@ -76,59 +76,45 @@ torchrun --nnodes=1 --nproc-per-node=8 --master_port 29501 quant.py \
 
 ### GLM-5.3 BF16 → 混合 INT4/INT8 W4A8
 
-与 `examples/glm/quantize_glm5_3_int4_channel.py` 默认命令的量化范围、channel 粒度、
-compressed-tensors 加载格式一致：主干 layers.3–77 routed experts 为 INT4，dense/shared MLP、
-MLA q_a/q_b/kv_a/o、indexer wq_b/wk 为 INT8；MTP layers.78 的相应 Linear 为 INT8，
+主干 layers.3–77 的 routed experts 为 channel INT4，dense/shared MLP、MLA
+q_a/q_b/kv_a/o、indexer wq_b/wk 为 channel INT8；MTP layers.78 的相应 Linear 为 INT8。
 router、kv_b_proj、indexer weights_proj、norm、embedding、lm_head 和 MTP 专用投影/头保持 BF16。
-主干使用数据集校准的 GPTQ，MTP 使用 RTN，因此主干权重数值不会与原 RTN 模型逐字节一致，
-任务精度需要另行对比。激活的 INT8 动态量化在推理时执行，GPTQ 校准本身只量化权重。
+
+#### 默认：MTP 用 INT8 → `GLM-5.3-CHANNEL-INT4-w4a8-GPTQ`
 
 ```bash
-cd /quant_models/one-click-quant/utils/MoE-Quant
+cd /my_code/Quantitative_Code/one-click-quant/utils/MoE-Quant
 bash tests/run_glm5_3_w4a8.sh
 ```
 
-脚本默认读取 `/llm-models/GLM-5.3-BF16` 和本地 `OpenThoughts-114k`，使用 8 卡、
-512 条校准数据、最大长度 4096。生成的 GPTQ 中间结果为
-`/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-intermediate`，最终可加载模型为
-`/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ`。
-可通过 `MODEL_PATH`、`DATASET`、`SAVE_MODEL_PATH`、`PACKED_MODEL_PATH`、
-`NPROC_PER_NODE`、`NUM_CALIBRATION_SAMPLES`、`MAX_SEQUENCE_LENGTH`、`MASTER_PORT` 覆盖默认值。
-卡数须整除 256 个专家，校准样本数应为卡数的倍数；Python 环境需要能导入
-`transformers.models.glm_moe_dsa`，以及 torch、triton、accelerate、datasets、safetensors、compressed-tensors。
+输出：
 
-这里不能加 `--quantize_only_experts`（会把 dense/shared/attention/indexer 留在 BF16），
-不能设置 `--group_size`（目标是 channel），打包使用 `--activation-bits 8`，
-并选择 `--mtp-int8`（默认脚本）或 `--mtp-int4`。
-完整两阶段命令见 [tests/run_glm5_3_w4a8.sh](./tests/run_glm5_3_w4a8.sh)。
+- 中间结果 `/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-intermediate`
+- 打包产物 `/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ`
 
-若需要把 MTP routed experts 也改成 INT4，运行：
+默认读取 `/llm-models/GLM-5.3-BF16` 和本地 `OpenThoughts-114k`，8 卡、512 条校准数据、
+最大长度 4096。可用 `MODEL_PATH`、`DATASET`、`SAVE_MODEL_PATH`、`PACKED_MODEL_PATH`、
+`NPROC_PER_NODE`、`NUM_CALIBRATION_SAMPLES`、`MAX_SEQUENCE_LENGTH`、`MASTER_PORT` 覆盖。
+
+#### MTP 的 routed experts 也用 INT4 → `GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-MTP-INT4`
 
 ```bash
+cd /my_code/Quantitative_Code/one-click-quant/utils/MoE-Quant
 bash tests/run_glm5_3_w4a8.sh --mtp-int4
 ```
 
-该命令的默认输出为 `/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-MTP-INT4`。
-主干校准和中间结果与默认 INT8 MTP 方案相同。若已有中间结果，只需重新打包：
+输出打包产物 `/quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-MTP-INT4`。
+主干校准和中间结果与默认方案相同，因此已有中间结果时只需重新打包：
 
 ```bash
 python pack_quantized_model.py \
   --model_name_or_path /llm-models/GLM-5.3-BF16 \
   --quantized_model_path /quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-intermediate \
   --packed_model_path /quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-MTP-INT4 \
-  --dtype bfloat16 \
-  --activation-bits 8 \
-  --mtp-int4
+  --dtype bfloat16 --activation-bits 8 --mtp-int4
 ```
 
-`--mtp-int4` 仅改变 MTP 的 routed experts（gate/up/down），不覆盖其它 MTP 模块的 INT8/BF16
-设置，也不对 MTP 做 GPTQ 校准。INT4 config targets 同时覆盖 checkpoint 的
-`model.layers.78.mlp.experts.*` 和 sglang NextN 的 `model.decoder.mlp.experts.*`。
-当前此参数仅支持普通 GLM-5.3（`glm_moe_dsa`），Flash 仍使用 `--mtp-int8`。
-
-CPU 回归检查：`python tests/test_glm5_3_mtp_int4.py`，覆盖量化数值、打包、MTP 命名匹配和参数互斥。
-
-> 数据集下载和离线使用，可能需要设置环境变量 HF_ENDPOINT=https://hf-mirror.com 或 HF_DATASETS_OFFLINE=1
+当前 `--mtp-int4` 仅支持普通 GLM-5.3（`glm_moe_dsa`），Flash 仍使用 `--mtp-int8`。
 
 ### 模型打包命令
 ```shell
@@ -139,26 +125,58 @@ python pack_quantized_model.py \
     --dtype bfloat16
 ```
 
-### Step5 全主干 INT4 W4A8
+### Step5 混合精度 W4A8 / W8A8
 
-`tests/run_step5_w4a8_gptq.sh` 使用独立的 `step-5-preview-full-int4-GPTQ*`
-目录：主干路由专家、attention 的 q/k/v/o/g 投影、普通/共享 MLP 及
-`lm_head` 均使用 channel INT4 GPTQ；MTP attention、MLP 和
-`transformer.shared_head.output` 使用 channel INT4 RTN（`--mtp-int4`）。
-router、norm、embedding、视觉模块及 MTP `eh_proj` 保持原精度。
-`lm_head` 的 Hessian 从校准序列的最终 norm 输出收集；MTP 不参与主干校准。
-旧版仅专家的中间产物不能用 `--pack-only` 复用，新版元数据会拒绝它。
+Step5 有两套固定配方，由 `tests/run_step5_w4a8_gptq.sh` 的 `RECIPE` 变量选择。
+量化范围在 adapter 内按配方写死，不接受 `--force_int8`。
 
-**当前 vLLM Step5 runtime 不支持直接加载这一新产物**：其 attention、
-共享 MLP 和 `lm_head` 构造函数传入了 `quant_config=None`，需要先完成
-运行时量化层与融合权重加载适配，并做实际启动/输出测试。因此脚本默认只量化、
-打包和校验；`SERVE_AFTER_PACK=1` 仅用于已完成运行时适配的环境。
-`step-5_zyq` 容器没有挂载脚本默认的 `/DL_DATA`、`/quant_models`，运行前须
-指定容器内可见的 `MODEL_PATH`、`DATASET`、输出路径及其可写挂载。
+| 配方 | `RECIPE` | 路由专家 | attention / 普通 MLP / 共享 MLP | `lm_head` | MTP |
+|---|---|---|---|---|---|
+| 仅专家 | `experts` | INT4 W4A8 GPTQ | BF16 | BF16 | BF16 |
+| 混合精度 | `mixed` | INT4 W4A8 GPTQ | INT8 W8A8 GPTQ | INT8 RTN | INT8 RTN |
 
-CPU 合同检查：`PYTHONDONTWRITEBYTECODE=1 python tests/test_step5_full_int4.py`。
-完整的变更范围、数据流、运行与验证说明见
-[STEP5_FULL_INT4_W4A8_ZH.md](./STEP5_FULL_INT4_W4A8_ZH.md)。
+两套配方下 router、norm、embedding、`eh_proj`、视觉模块和 DSA 索引器都保持
+源精度，layers 88–90 的路由专家也保持 BF16。
+
+#### 配方一：仅量化路由专家 → `step-5-preview-channel-w4a8-GPTQ`
+
+```bash
+cd /my_code/Quantitative_Code/one-click-quant/utils/MoE-Quant
+
+HIP_VISIBLE_DEVICES=2,5,6,7 \
+NPROC_PER_NODE=4 \
+MODEL_PATH=/DL_DATA/step-5-preview-0913-fp8-channel \
+DATASET=/quant_models/step5-gptq-calibration/sharegpt_code_general_512_seed0.jsonl \
+NUM_CALIBRATION_SAMPLES=512 \
+MAX_SEQUENCE_LENGTH=4096 \
+RECIPE=experts \
+bash tests/run_step5_w4a8_gptq.sh --run
+```
+
+输出：
+
+- 中间结果 `/quant_models/step-5-preview-channel-w4a8-GPTQ-intermediate`
+- 打包产物 `/quant_models/step-5-preview-channel-w4a8-GPTQ`
+
+#### 配方二：INT4 专家 + INT8 主干 → `step-5-preview-int4-int8-GPTQ`
+
+```bash
+cd /my_code/Quantitative_Code/one-click-quant/utils/MoE-Quant
+
+HIP_VISIBLE_DEVICES=2,5,6,7 \
+NPROC_PER_NODE=4 \
+MODEL_PATH=/DL_DATA/step-5-preview-0913-fp8-channel \
+DATASET=/quant_models/step5-gptq-calibration/sharegpt_code_general_512_seed0.jsonl \
+NUM_CALIBRATION_SAMPLES=512 \
+MAX_SEQUENCE_LENGTH=4096 \
+RECIPE=mixed \
+bash tests/run_step5_w4a8_gptq.sh --run
+```
+
+输出：
+
+- 中间结果 `/quant_models/step-5-preview-int4-int8-GPTQ-intermediate`
+- 打包产物 `/quant_models/step-5-preview-int4-int8-GPTQ`
 
 ### 已支持模型
 - DeepSeek-V3 (DeepseekV3ForCausalLM)

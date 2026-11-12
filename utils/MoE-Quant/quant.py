@@ -572,8 +572,9 @@ def quantize_step5_head(args, runtime, model_context, calibration, checkpoint):
     )
     for states in calibration.inputs:
         handle.update(norm(states.to(runtime.device)).to(head.weight.dtype))
-    dist_utils.print_on_main("Quantizing lm_head (bits=4)")
-    quantize_shared_handle("lm_head", handle, args, 4)
+    lm_head_bits = adapter.resolve_layer_bits("lm_head", args.bits, args.force_int8)
+    dist_utils.print_on_main(f"Quantizing lm_head (bits={lm_head_bits})")
+    quantize_shared_handle("lm_head", handle, args, lm_head_bits)
     head.to(device="meta")
     norm.to(device="meta")
     torch.cuda.empty_cache()
