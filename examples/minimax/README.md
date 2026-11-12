@@ -1,4 +1,4 @@
-### QMiniMax-M2.5-W8A8-INT8
+### MiniMax-M2.5-W8A8-INT8
 
 ```bash
 vllm v0.19.0 or
@@ -9,6 +9,15 @@ python3.10 -m pip install -U "huggingface-hub>=1.5.0,<2.0" "kernels>=0.12.0,<0.1
 python3.10 -m pip install "huggingface-hub>=0.34.0,<1.0"
 python3 main.py --model /models/MiniMax-M2.5 --scheme FP8_TO_BF16 --save-dir /models/MiniMax-M2.5-BF16
 python main.py --model /models/MiniMax-M2.5-BF16 --scheme W8A8 --alg ptq --needs-data false --ignore 'lm_head,re:.*moe.gate+,re:.*moe.e_score_correction_bias+' --save-dir /models/MiniMax-M2.5-W8A8
+```
+
+### MiniMax-H3-mxfp4-w4a4
+
+```bash
+python quantize_minimax_h3_t2va_mxfp4.py \
+  --input-dir /models/MiniMax/MiniMax-H3 \
+  --output-dir /models/MiniMax-H3-mxfp4-w4a4 \
+  --mode w4a4
 ```
 
 ### MiniMax M3.1 Flash native quantization
