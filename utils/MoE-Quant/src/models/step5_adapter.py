@@ -35,9 +35,19 @@ def get_reference_converter():
 
 
 class Step5Adapter(ModelAdapter):
+    """Step-5 GPTQ adapter: fixed mixed-precision recipe.
+
+    Routed experts are channel INT4 W4A8 GPTQ. Attention, dense MLP, the
+    shared expert and ``lm_head`` are channel INT8 W8A8 GPTQ. MTP bypasses
+    GPTQ and is RTN INT8 at packing time (``--mtp-int8``). Everything else
+    (router/norm/embedding/``eh_proj``/vision/DSA, and the layers 88-90
+    backbone experts) stays source precision.
+    """
+
     name = "step5"
     load_only_required_tensors = True
-    supports_mtp_int4 = True
+    supports_mtp_int4 = False
+    supports_mtp_int8 = True
     _routed_expert_pattern = re.compile(r"(?:^|\.)moe\.experts\.\d+\.(?:gate|up|down)_proj(?:\.|$)")
 
     @classmethod
@@ -67,14 +77,14 @@ class Step5Adapter(ModelAdapter):
         for name, (dtype, shape) in self.meta.items():
             match = backbone.fullmatch(name)
             if match and int(match[1]) < int(self.text["num_hidden_layers"]):
-                if len(shape) != 2 or shape[1] % 8:
-                    raise ValueError(f"Unsupported Step5 INT4 backbone shape: {name}: {shape}")
-                self.layer_bits[name.removesuffix(".weight")] = 4
+                if len(shape) != 2:
+                    raise ValueError(f"Unsupported Step5 INT8 backbone shape: {name}: {shape}")
+                self.layer_bits[name.removesuffix(".weight")] = 8
         if "lm_head.weight" not in self.meta:
             raise ValueError("Step5 checkpoint is missing lm_head.weight")
-        if len(self.meta["lm_head.weight"][1]) != 2 or self.meta["lm_head.weight"][1][1] % 8:
-            raise ValueError("Step5 lm_head must be a 2D INT4-compatible matrix")
-        self.layer_bits["lm_head"] = 4
+        if len(self.meta["lm_head.weight"][1]) != 2:
+            raise ValueError("Step5 lm_head must be a 2D matrix")
+        self.layer_bits["lm_head"] = 8
         self.mtp_names = set()
         start = int(self.text["num_hidden_layers"])
         end = start + int(self.text.get("num_nextn_predict_layers", 0))
@@ -87,8 +97,8 @@ class Step5Adapter(ModelAdapter):
         for name, (_, shape) in self.meta.items():
             match = mtp.fullmatch(name)
             if match and start <= int(match[1]) < end:
-                if len(shape) != 2 or shape[1] % 8:
-                    raise ValueError(f"Unsupported Step5 MTP INT4 shape: {name}: {shape}")
+                if len(shape) != 2:
+                    raise ValueError(f"Unsupported Step5 MTP INT8 shape: {name}: {shape}")
                 self.mtp_names.add(name.removesuffix(".weight"))
         if end > start and not self.mtp_names:
             raise ValueError("Step5 MTP layers configured but no quantizable MTP weights found")
@@ -98,7 +108,7 @@ class Step5Adapter(ModelAdapter):
             "source_weight_map_sha256": _digest(self.weight_map),
             "source_tensor_metadata_sha256": _digest(self.meta),
             "backbone_algorithm": "gptq",
-            "mtp_algorithm": "rtn_int4",
+            "mtp_algorithm": "rtn_int8",
             "quantized_layers": sorted(self.layer_bits),
             "mtp_layers": sorted(self.mtp_names),
         }
@@ -185,9 +195,9 @@ class Step5Adapter(ModelAdapter):
 
     def resolve_ignore(self, ignore=None, quantize_only_experts=False, force_int8=None):
         if quantize_only_experts:
-            raise ValueError("Step5 full INT4 recipe does not support --quantize_only_experts.")
+            raise ValueError("Step5 mixed INT4/INT8 recipe does not support --quantize_only_experts.")
         if force_int8:
-            raise ValueError("Step5 full INT4 recipe does not support --force_int8.")
+            raise ValueError("Step5 mixed INT4/INT8 recipe does not support --force_int8.")
         rules = [
             rule for rule in self.default_ignore_rules()
             if rule not in (
@@ -206,14 +216,14 @@ class Step5Adapter(ModelAdapter):
             )
         if ignore:
             if sorted(ignore) != sorted(rules):
-                raise ValueError("Step5 full INT4 recipe uses a fixed ignore scope.")
+                raise ValueError("Step5 mixed INT4/INT8 recipe uses a fixed ignore scope.")
         return rules
 
     def resolve_layer_bits(self, layer_name, default_bits, force_int8=None):
         del default_bits, force_int8
         if layer_name not in self.layer_bits:
             raise ValueError(f"Step5 policy does not select {layer_name}")
-        return 4
+        return self.layer_bits[layer_name]
 
     def expected_quantized_layer_names(self, model=None):
         del model
@@ -264,9 +274,9 @@ class Step5Adapter(ModelAdapter):
 
     def validate_packing_args(self, args):
         if args.bits != 4 or args.group_size is not None or args.dtype != "bfloat16" or args.activation_bits != 8:
-            raise ValueError("Step5 packing requires channel W4A8 with --dtype bfloat16.")
-        if args.mtp_int8 or (self.mtp_names and not args.mtp_int4):
-            raise ValueError("Step5 MTP requires --mtp-int4 (INT4 RTN) and does not support --mtp-int8.")
+            raise ValueError("Step5 packing requires channel W4A8/W8A8 with --dtype bfloat16.")
+        if args.mtp_int4 or (self.mtp_names and not args.mtp_int8):
+            raise ValueError("Step5 MTP requires --mtp-int8 (INT8 RTN) and does not support --mtp-int4.")
 
     def quantization_metadata(self):
         result = {"step5_source_manifest": copy.deepcopy(self._manifest)}

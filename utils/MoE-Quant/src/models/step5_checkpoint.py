@@ -1,4 +1,4 @@
-"""Stream Step-5 GPTQ artifacts into the existing channel W4A8 layout."""
+"""Stream Step-5 GPTQ artifacts into the existing mixed channel W4A8/W8A8 layout."""
 
 from collections import Counter
 from contextlib import ExitStack
@@ -24,11 +24,15 @@ def expected_schema(adapter):
     for item in adapter.plan:
         dtype, source_shape = adapter.meta[item.source]
         shape = source_shape[1:] if item.expert is not None else source_shape
-        if item.output.removesuffix(".weight") in adapter.layer_bits or item.output.removesuffix(".weight") in adapter.mtp_names:
-            module = item.output.removesuffix(".weight")
+        module = item.output.removesuffix(".weight")
+        bits = adapter.layer_bits.get(module, 8 if module in adapter.mtp_names else None)
+        if bits == 4:
             result[module + ".weight_packed"] = ("I32", (shape[0], shape[1] // 8))
             result[module + ".weight_scale"] = ("F32", (shape[0], 1))
             result[module + ".weight_shape"] = ("I64", (2,))
+        elif bits == 8:
+            result[module + ".weight"] = ("I8", tuple(shape))
+            result[module + ".weight_scale"] = ("F32", (shape[0], 1))
         else:
             if dtype in get_reference_converter().FP8:
                 dtype = "BF16"
@@ -39,10 +43,9 @@ def expected_schema(adapter):
 def compression_config(adapter):
     converter = get_reference_converter()
     result = copy.deepcopy(adapter.raw_config["quantization_config"])
-    group = converter.compression_config(adapter.raw_config, adapter.plan)["config_groups"]["group_w4a8"]
-    expert_targets = list(group["targets"])
+    group4 = converter.compression_config(adapter.raw_config, adapter.plan)["config_groups"]["group_w4a8"]
     expert_names = {item.output.removesuffix(".weight") for item in adapter.plan if item.int4}
-    targets = sorted((set(adapter.layer_bits) - expert_names) | adapter.mtp_names)
+    int8_names = sorted((set(adapter.layer_bits) - expert_names) | adapter.mtp_names)
     # Runtime fuses q/k/v and gate/up, and renames the MTP prediction head.
     runtime = [
         r"re:.*model\.layers\.\d+\.(?:mtp_block\.)?self_attn\.(?:qkv_proj|qkvg_proj)$",
@@ -50,8 +53,16 @@ def compression_config(adapter):
         r"re:.*model\.layers\.\d+\.moe\.share_expert\.(?:gate_up_proj|down_proj)$",
         r"re:.*model\.layers\.\d+\.shared_head\.head$",
     ]
-    group["targets"] = expert_targets + targets + runtime
-    result["config_groups"] = {"group_w4a8": group}
+    group8 = {
+        "targets": int8_names + runtime,
+        "format": "int-quantized",
+        "weights": dict(num_bits=8, type="int", strategy="channel", symmetric=True,
+                        dynamic=False, group_size=None, observer="minmax"),
+        "input_activations": dict(num_bits=8, type="int", strategy="token",
+                                  symmetric=True, dynamic=True, group_size=None),
+        "output_activations": None,
+    }
+    result["config_groups"] = {"group_int4": group4, "group_int8": group8}
     result.update(format="pack-quantized", quantization_status="compressed",
                   global_compression_ratio=None)
     # Exact targets avoid inadvertently quantizing routers, norms, ViT or eh_proj.
@@ -67,52 +78,72 @@ def compression_config(adapter):
     ]
     for item in adapter.plan:
         module = item.output.removesuffix(".weight")
-        selected = converter.matches(module, group["targets"]) and not converter.matches(module, result["ignore"])
-        if selected != (module in adapter.layer_bits or module in adapter.mtp_names):
+        in_int4 = converter.matches(module, group4["targets"])
+        in_int8 = converter.matches(module, group8["targets"])
+        if in_int4 and in_int8:
+            raise ValueError(f"Step5 INT4/INT8 targets overlap: {module}")
+        ignored = converter.matches(module, result["ignore"])
+        selected_bits = 4 if (in_int4 and not ignored) else 8 if (in_int8 and not ignored) else None
+        expected_bits = adapter.layer_bits.get(module, 8 if module in adapter.mtp_names else None)
+        if selected_bits != expected_bits:
             raise ValueError(f"Step5 config targets disagree with output: {module}")
     return result
 
 
-def pack_artifact(path, module, shape):
+def pack_artifact(path, module, shape, bits):
     artifact = torch.load(path, map_location="cpu", weights_only=True)
     codes, scales, zeros = (artifact[k] for k in ("qweight", "scale", "zero"))
-    if artifact.get("bits") != 4 or codes.dtype != torch.uint8 or tuple(codes.shape) != tuple(shape):
+    if artifact.get("bits") != bits or codes.dtype != torch.uint8 or tuple(codes.shape) != tuple(shape):
         raise ValueError(f"Invalid Step5 GPTQ codes/bits: {module}")
     if tuple(scales.shape) != (shape[0], 1) or tuple(zeros.shape) != (shape[0], 1):
         raise ValueError(f"Invalid Step5 channel metadata: {module}")
-    if not torch.isfinite(scales).all() or not (scales > 0).all() or not (zeros == 8).all():
+    center = 2 ** (bits - 1)
+    if not torch.isfinite(scales).all() or not (scales > 0).all() or not (zeros == center).all():
         raise ValueError(f"Invalid Step5 scales/zero points: {module}")
-    if (codes > 15).any():
-        raise ValueError(f"Step5 INT4 code exceeds 15: {module}")
-    # GPTQ stores offset binary codes already; do not add the offset again.
-    lanes = codes.to(torch.int32).reshape(shape[0], -1, 8)
-    shifts = torch.arange(8, dtype=torch.int32) * 4
-    packed = (lanes << shifts).sum(-1, dtype=torch.int32)
+    if bits == 4:
+        if (codes > 15).any():
+            raise ValueError(f"Step5 INT4 code exceeds 15: {module}")
+        # GPTQ stores offset binary codes already; do not add the offset again.
+        lanes = codes.to(torch.int32).reshape(shape[0], -1, 8)
+        shifts = torch.arange(8, dtype=torch.int32) * 4
+        packed = (lanes << shifts).sum(-1, dtype=torch.int32)
+        return {
+            module + ".weight_packed": packed,
+            module + ".weight_scale": scales.float().contiguous(),
+            module + ".weight_shape": torch.tensor(shape, dtype=torch.int64),
+        }
+    # Do the subtraction before narrowing to int8: uint8 code 255 and zero=128
+    # must never wrap or saturate independently.
+    signed = (codes.to(torch.int32) - zeros.to(torch.int32)).to(torch.int8)
     return {
-        module + ".weight_packed": packed,
+        module + ".weight": signed.contiguous(),
         module + ".weight_scale": scales.float().contiguous(),
-        module + ".weight_shape": torch.tensor(shape, dtype=torch.int64),
     }
 
 
-def pack_rtn(value, module, fp8_scale=None):
-    converter = get_reference_converter()
-    if value.ndim != 2 or value.shape[1] % 8:
-        raise ValueError(f"Step5 MTP INT4 requires [N, K] with K divisible by 8: {module}")
-    packed = torch.empty((value.shape[0], value.shape[1] // 8), dtype=torch.int32)
+def pack_rtn_int8(value, module, fp8_scale=None):
+    """RTN channel-wise INT8 for an MTP Linear that bypasses GPTQ.
+
+    Same abs-max/127 formula as pack_quantized_model.py's pack_int8_rtn,
+    adapted to this file's streaming block-of-256 loop and FP8 dequant.
+    """
+    if value.ndim != 2:
+        raise ValueError(f"Step5 MTP INT8 requires a 2D weight: {module}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    signed = torch.empty(value.shape, dtype=torch.int8)
     scale = torch.empty((value.shape[0], 1), dtype=torch.float32)
     for begin in range(0, value.shape[0], 256):
         end = min(begin + 256, value.shape[0])
-        block = value[begin:end]
+        block = value[begin:end].to(device=device, dtype=torch.float32)
         if fp8_scale is not None:
-            block = block.float() * fp8_scale[begin:end].float().reshape(-1, 1)
-        codes, scales, _ = converter.quantize_int4(block)
-        packed[begin:end] = codes.cpu()
-        scale[begin:end] = scales.cpu()
+            block = block * fp8_scale[begin:end].to(device=device, dtype=torch.float32).reshape(-1, 1)
+        block_scale = block.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 127.0
+        codes = torch.round(block / block_scale).clamp(-127, 127).to(torch.int8)
+        signed[begin:end] = codes.cpu()
+        scale[begin:end] = block_scale.float().cpu()
     return {
-        module + ".weight_packed": packed,
+        module + ".weight": signed.contiguous(),
         module + ".weight_scale": scale,
-        module + ".weight_shape": torch.tensor(value.shape, dtype=torch.int64),
     }
 
 
@@ -166,20 +197,21 @@ def pack_checkpoint(adapter, args, metadata=None):
         for i, item in enumerate(adapter.plan, 1):
             module = item.output.removesuffix(".weight")
             if module in adapter.layer_bits:
+                bits = adapter.layer_bits[module]
                 _, shape = adapter.meta[item.source]
                 shape = shape[1:] if item.expert is not None else shape
-                output = pack_artifact(intermediate / module / "quantized_weight.pt", module, shape)
+                output = pack_artifact(intermediate / module / "quantized_weight.pt", module, shape, bits)
                 for key, value in output.items():
                     writer.add(key, value)
-                counts["gptq_int4_matrices"] += 1
+                counts[f"gptq_int{bits}_matrices"] += 1
             elif module in adapter.mtp_names:
                 value = read(item.source, item.expert)
                 scale = None
                 if adapter.meta[item.source][0] in converter.FP8:
                     scale = read(item.source.removesuffix(".weight") + ".weight_scale", item.expert)
-                for key, tensor in pack_rtn(value, module, fp8_scale=scale).items():
+                for key, tensor in pack_rtn_int8(value, module, fp8_scale=scale).items():
                     writer.add(key, tensor)
-                counts["mtp_rtn_int4_matrices"] += 1
+                counts["mtp_rtn_int8_matrices"] += 1
             else:
                 value = read(item.source, item.expert)
                 if adapter.meta[item.source][0] in converter.FP8:

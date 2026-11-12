@@ -5,8 +5,8 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 MODEL_PATH="${MODEL_PATH:-/DL_DATA/step-5-preview-0913-fp8-channel}"
 DATASET="${DATASET:-/quant_models/step5-gptq-calibration/sharegpt_code_general_512_seed0.jsonl}"
-SAVE_MODEL_PATH="${SAVE_MODEL_PATH:-/quant_models/step-5-preview-full-int4-GPTQ-intermediate}"
-PACKED_MODEL_PATH="${PACKED_MODEL_PATH:-/quant_models/step-5-preview-full-int4-GPTQ}"
+SAVE_MODEL_PATH="${SAVE_MODEL_PATH:-/quant_models/step-5-preview-mixed-w4a8-w8a8-GPTQ-intermediate}"
+PACKED_MODEL_PATH="${PACKED_MODEL_PATH:-/quant_models/step-5-preview-mixed-w4a8-w8a8-GPTQ}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 NUM_CALIBRATION_SAMPLES="${NUM_CALIBRATION_SAMPLES:-512}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-4096}"
@@ -20,7 +20,7 @@ export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/quant_models/.cache/step5-gptq-datasets}"
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/quant_models/.cache/step5-gptq-modules}"
-export LOG_DIR="${LOG_DIR:-/quant_models/logs/step5-gptq}"
+export LOG_DIR="${LOG_DIR:-/my_code/Quantitative_Code/one-click-quant/logs/step5-gptq}"
 mkdir -p "$LOG_DIR" "$HF_DATASETS_CACHE" "$HF_MODULES_CACHE"
 if [[ "$MODE" != --preflight ]]; then
     exec 8>"$LOG_DIR/.quantization.lock"
@@ -59,13 +59,14 @@ fi
 echo "STAGE=pack"
 python pack_quantized_model.py --model_name_or_path "$MODEL_PATH" \
   --quantized_model_path "$SAVE_MODEL_PATH" --packed_model_path "$PACKED_MODEL_PATH" \
-  --dtype bfloat16 --activation-bits 8 --mtp-int4 --max-shard-size-mb 2048
+  --dtype bfloat16 --activation-bits 8 --mtp-int8 --max-shard-size-mb 2048
 python tests/check_step5.py --source "$MODEL_PATH" --packed "$PACKED_MODEL_PATH"
 echo "STAGE=model_ready"
 
-# The Step5 vLLM runtime must be taught to load non-expert INT4 before serving.
+# The Step5 vLLM runtime must be taught to load non-expert INT8 (and the
+# shared/dense MLP INT8 path) before serving.
 if [[ "${SERVE_AFTER_PACK:-0}" != 1 ]]; then
-    echo "Skipping serve/evaluation (set SERVE_AFTER_PACK=1 only after runtime INT4 support is verified)."
+    echo "Skipping serve/evaluation (set SERVE_AFTER_PACK=1 only after runtime INT8 support is verified)."
     exit 0
 fi
 # The existing per-port lock prevents duplicate server/evaluation workflows.
