@@ -38,8 +38,8 @@ class Step5Adapter(ModelAdapter):
     """Step-5 GPTQ adapter: fixed mixed-precision recipe.
 
     Routed experts are channel INT4 W4A8 GPTQ. Attention, dense MLP, the
-    shared expert and ``lm_head`` are channel INT8 W8A8 GPTQ. MTP bypasses
-    GPTQ and is RTN INT8 at packing time (``--mtp-int8``). Everything else
+    shared expert are channel INT8 W8A8 GPTQ. The packed ``lm_head`` and MTP
+    use RTN INT8 (``--mtp-int8`` for MTP). Everything else
     (router/norm/embedding/``eh_proj``/vision/DSA, and the layers 88-90
     backbone experts) stays source precision.
     """
@@ -174,6 +174,38 @@ class Step5Adapter(ModelAdapter):
 
     def get_final_tensor_keys(self):
         return ["lm_head.weight", "model.norm.weight"]
+
+    def quantize_output_head(self, model, args, runtime, inputs, weight_dir, quantize_shared_handle):
+        if "lm_head" not in self.layer_bits:
+            return
+
+        from safetensors import safe_open
+        from .. import gptq, quant_utils
+
+        def read(name):
+            with safe_open(Path(weight_dir) / self.weight_map[name], framework="pt", device="cpu") as source:
+                return source.get_tensor(name)
+
+        norm = model.model.norm.to_empty(device=runtime.device)
+        norm.weight.data = read("model.norm.weight").to(runtime.device, dtype=torch.float32)
+        head = model.lm_head.to_empty(device=runtime.device)
+        weight = read("lm_head.weight")
+        if weight.dtype in quant_utils.FP8_DTYPES:
+            scale = read("lm_head.weight_scale")
+            weight = (weight.float() * scale.float().reshape(-1, 1)).to(runtime.dtype)
+        head.weight.data = weight.to(runtime.device, dtype=runtime.dtype)
+        del weight
+        handle = gptq.GPTQ(
+            head, args.group_size, args.sym, args.rel_damp, args.block_size,
+            args.quantization_order, args.quantization_scale, is_distributed=True,
+        )
+        for states in inputs:
+            handle.update(norm(states.to(runtime.device)).to(head.weight.dtype))
+        bits = self.resolve_layer_bits("lm_head", args.bits, args.force_int8)
+        quantize_shared_handle("lm_head", handle, args, bits)
+        head.to(device="meta")
+        norm.to(device="meta")
+        torch.cuda.empty_cache()
 
     def checkpoint_keys_for_model_key(self, model_key, weight_map):
         match = re.match(r"^(model\.layers\.(\d+)\.moe\.experts\.(\d+)\.(gate_proj|up_proj|down_proj))(\.weight)$", model_key)

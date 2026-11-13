@@ -107,3 +107,34 @@ python quantize_glm5_3_int4_channel.py \
   --output-dir /quant_models/GLM-5.3-CHANNEL-INT4-w4a8
 ```
 
+### GLM-5.3 / GLM-5.3-Flash 混合精度 GPTQ W4A8
+
+在仓库根目录运行：
+
+```bash
+cd utils/MoE-Quant
+bash tests/run_glm5_3_w4a8.sh            # GLM-5.3，MTP INT8 RTN
+bash tests/run_glm5_3_w4a8.sh --mtp-int4 # GLM-5.3，MTP 路由专家 INT4 RTN
+bash tests/run_glm5_flash_w4a8.sh       # GLM-5.3-Flash，MTP INT8 RTN
+```
+
+GLM-5.3 的 3–77 层路由专家用 channel INT4 GPTQ，普通/共享 MLP、MLA 的 q_a/q_b/kv_a/o
+和 indexer 的 wq_b/wk 用 channel INT8 GPTQ。router、kv_b_proj、indexer 的 weights_proj、
+norm、embedding、lm_head 和 MTP 专用投影/头保留 BF16。
+
+GLM-5.3 的第 78 层和 GLM-5.3-Flash 的第 45 层为 MTP 层，不参与 GPTQ。
+打包时 `--mtp-int8` 和 `--mtp-int4` 互斥；均不指定则保留 BF16。`--mtp-int4` 仅用于普通
+GLM-5.3，MTP 路由专家用 INT4 RTN，其余符合量化范围的 MTP Linear 用 INT8 RTN。
+Flash 的具体范围见 [运行脚本](../../utils/MoE-Quant/tests/run_glm5_flash_w4a8.sh)。
+
+普通 GLM-5.3 的两种 MTP 配方共用 GPTQ 中间结果。已有中间结果时，可以直接重新打包：
+
+```bash
+python pack_quantized_model.py \
+  --model_name_or_path /llm-models/GLM-5.3-BF16 \
+  --quantized_model_path /quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-intermediate \
+  --packed_model_path /quant_models/GLM-5.3-CHANNEL-INT4-w4a8-GPTQ-MTP-INT4 \
+  --dtype bfloat16 --activation-bits 8 --mtp-int4
+```
+
+默认模型、校准数据和输出目录见 [GLM-5.3 脚本](../../utils/MoE-Quant/tests/run_glm5_3_w4a8.sh)。

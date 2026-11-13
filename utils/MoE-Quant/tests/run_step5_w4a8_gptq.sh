@@ -7,8 +7,8 @@ MODEL_PATH="${MODEL_PATH:-/DL_DATA/step-5-preview-0913-fp8-channel}"
 DATASET="${DATASET:-/quant_models/step5-gptq-calibration/sharegpt_code_general_512_seed0.jsonl}"
 # RECIPE selects one of the two fixed Step5 scopes:
 #   experts -> routed experts only (channel INT4 W4A8), everything else BF16
-#   mixed   -> routed experts INT4 W4A8 + attention/dense MLP/shared MLP/lm_head
-#              INT8 W8A8 + MTP INT8 RTN
+#   mixed   -> routed experts INT4 W4A8 + attention/dense MLP/shared MLP
+#              INT8 W8A8 + lm_head/MTP INT8 RTN
 RECIPE="${RECIPE:-mixed}"
 case "$RECIPE" in
     experts)
@@ -33,7 +33,14 @@ esac
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 NUM_CALIBRATION_SAMPLES="${NUM_CALIBRATION_SAMPLES:-512}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-4096}"
-MODE="${1:---run}"
+MODE="${1---run}"
+case "$MODE" in
+    --run|--pack-only|--preflight) ;;
+    *)
+        printf 'Unknown MODE: %s\nUsage: %s [--run|--pack-only|--preflight]\n' "$MODE" "$0" >&2
+        exit 2
+        ;;
+esac
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-2,5,6,7}"
 export NCCL_IB_DISABLE=1
 export HSA_FORCE_FINE_GRAIN_PCIE=1
@@ -55,7 +62,6 @@ printf 'Workflow PID=%s log=%s\n' "$$" "$LOG_FILE"
 printf '%s\n' "$$" > "$LOG_DIR/workflow.pid"
 printf '%s\n' "$LOG_FILE" > "$LOG_DIR/latest_log"
 
-case "$MODE" in --run|--pack-only|--preflight) ;; *) exit 2 ;; esac
 python tests/check_step5.py --source "$MODEL_PATH" "${CHECK_SCOPE_ARGS[@]}"
 if [[ "$MODE" == --preflight ]]; then exit 0; fi
 [[ -f "$DATASET" ]] || { echo "Missing local calibration data: $DATASET"; exit 1; }
