@@ -173,6 +173,10 @@ class ModelAdapter:
     def get_final_tensor_keys(self) -> List[str]:
         return ["lm_head.weight", "model.norm.weight"]
 
+    def quantize_output_head(self, model, args, runtime, inputs, weight_dir, quantize_shared_handle) -> None:
+        """Optionally quantize the output head using the final decoder activations."""
+        return None
+
     def is_routed_expert(self, layer_name: str) -> bool:
         """Identify a routed expert Linear by its module name."""
         return self._routed_expert_pattern.search(layer_name) is not None

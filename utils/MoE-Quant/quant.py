@@ -691,6 +691,7 @@ def process(args, runtime=None, model_context=None, calibration=None, checkpoint
 
         release(block, prefix, checkpoint, runtime)
 
+    adapter.quantize_output_head(model, args, runtime, inputs, checkpoint.weight_dir, quantize_shared_handle)
     dist_utils.barrier(device_ids=[rank])
     save_quantization_metadata(args, ignore_rules, adapter)
     cleanup_runtime()

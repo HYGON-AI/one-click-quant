@@ -9,6 +9,7 @@ from .glm_moe_dsa_adapter import GlmMoeDsaAdapter
 from .kimi_k3_adapter import KimiK3Adapter
 from .mimo_v2_adapter import MiMoV2Adapter
 from .qwen3_5_moe_adapter import Qwen35MoeAdapter
+from .step5_adapter import Step5Adapter
 from .registry import get_model_adapter
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "KimiK3Adapter",
     "MiMoV2Adapter",
     "Qwen35MoeAdapter",
+    "Step5Adapter",
     "get_model_adapter",
 ]

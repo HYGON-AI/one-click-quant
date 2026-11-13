@@ -119,6 +119,45 @@ def prepare_open_platypus(
     return train_dataset
 
 
+def prepare_sharegpt(
+    tokenizer: AutoTokenizer,
+    max_sequence_length: int,
+    num_calibration_samples: Optional[int] = None,
+    seed: int = 42,
+    raw_dataset=None,
+) -> List[torch.Tensor]:
+    """Prepare the local ShareGPT JSON corpus commonly mounted in the container."""
+    if num_calibration_samples:
+        raw_dataset = raw_dataset.shuffle(seed=seed).select(range(num_calibration_samples))
+
+    def preprocess(example):
+        messages = []
+        for item in example.get("conversations", []):
+            role = {"human": "user", "gpt": "assistant", "system": "system"}.get(
+                item.get("from")
+            )
+            if role is not None and item.get("value"):
+                messages.append({"role": role, "content": item["value"]})
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            return tokenizer.apply_chat_template(messages, tokenize=False)
+        return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+
+    result = []
+    for example in raw_dataset:
+        text = preprocess(example)
+        encoded = tokenizer(
+            text,
+            padding=False,
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        if encoded["input_ids"].shape[1] > 1:
+            result.append(encoded["input_ids"])
+    return result
+
+
 def prepare_fineweb_edu(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
@@ -150,8 +189,12 @@ def prepare_calibration_dataset(
 ) -> List[torch.Tensor]:
     # A directory is a locally stored corpus: route on its schema so the local
     # copy goes through the same preprocessing as the matching Hub dataset.
-    if os.path.isdir(dataset_name):
-        raw_dataset = load_local_dataset(dataset_name)
+    if os.path.isdir(dataset_name) or os.path.isfile(dataset_name):
+        raw_dataset = (
+            load_local_dataset(dataset_name)
+            if os.path.isdir(dataset_name)
+            else load_dataset("json", data_files=dataset_name, split="train")
+        )
         columns = set(raw_dataset.column_names)
         if {"system", "conversations"} <= columns:
             return prepare_open_thoughts(
@@ -159,6 +202,10 @@ def prepare_calibration_dataset(
             )
         if {"instruction", "output"} <= columns:
             return prepare_open_platypus(
+                tokenizer, max_sequence_length, num_calibration_samples, seed, raw_dataset
+            )
+        if {"conversations"} <= columns:
+            return prepare_sharegpt(
                 tokenizer, max_sequence_length, num_calibration_samples, seed, raw_dataset
             )
         raise ValueError(

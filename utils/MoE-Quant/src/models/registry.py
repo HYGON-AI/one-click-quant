@@ -11,11 +11,13 @@ from .glm_moe_dsa_adapter import GlmMoeDsaAdapter
 from .kimi_k3_adapter import KimiK3Adapter
 from .mimo_v2_adapter import MiMoV2Adapter
 from .qwen3_5_moe_adapter import Qwen35MoeAdapter
+from .step5_adapter import Step5Adapter
 
 
 # More specific adapters must appear before less specific adapters.
 _ADAPTER_CLASSES: List[Type[ModelAdapter]] = [
     MiMoV2Adapter,
+    Step5Adapter,
     KimiK3Adapter,
     Glm5NextAdapter,
     GlmMoeDsaAdapter,
