@@ -30,10 +30,25 @@ def _kimi_modeling(path):
     """Import trusted local code with version bridges, without writing a HF module cache."""
     import transformers.utils.generic as generic
 
+    if torch.version.hip:
+        # FLA 0.6 selects bf16x3 from the Triton version alone, but the DCU
+        # backend does not support it. Use its full-precision fallback before
+        # any KDA backward kernel is compiled; keep the installed FLA unchanged.
+        import triton.language as tl
+        intra = importlib.import_module("fla.ops.kda.chunk_intra")
+        if getattr(getattr(intra, "SAFE_GATE_DOT_PRECISION", None), "value", None) == "bf16x3":
+            intra.SAFE_GATE_DOT_PRECISION = tl.constexpr("ieee")
+
     package_name = "_autoquant_kimi_" + hashlib.sha256(str(path).encode()).hexdigest()[:16]
     if package_name not in sys.modules:
         package = types.ModuleType(package_name)
         package.__path__ = [str(path)]
+        # K3.1 releases ship configuration/tokenizer code but no HF text model.
+        # Reuse the licensed text implementation; configuration still comes from
+        # the checkpoint, and all parameters are validated against its headers.
+        if not (path / "modeling_kimi_linear.py").is_file():
+            package.__path__.append(str(Path(__file__).resolve().parents[3]
+                                       / "examples/kimi/modeling"))
         sys.modules[package_name] = package
     if hasattr(generic, "OutputRecorder"):
         recorder = generic.OutputRecorder
@@ -59,7 +74,8 @@ def _kimi_modeling(path):
 class KimiScopeAdapter(ModelAdapter):
     grouping_rules = (r"^(language_model\.model\.layers\.\d+\.block_sparse_moe\.experts)\.\d+\.w[123]$",)
     # Remote attention residuals access these weights functionally, bypassing Linear.forward.
-    exclude_patterns = ("*.self_attention_res_proj", "*.mlp_res_proj", "*.output_attn_res_proj")
+    exclude_patterns = ("*.self_attention_res_proj", "*.mlp_res_proj", "*.output_attn_res_proj",
+                        "*.self_attn.indexer.*")
 
     def group_name(self, names):
         matches = [EXPERT.match(name) for name in names]
@@ -116,6 +132,25 @@ class _KimiTextModel(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
+class _KimiShortContextIndexer(nn.Module):
+    """Inventory DSA weights when every causal key fits in the top-k budget.
+
+    The indexer cannot change attention in this regime. Longer sequences are
+    rejected by KimiRuntime.forward rather than silently using dense attention.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        dsa = config.dsa_config
+        if dsa.get("index_rope_dim", 0) != 0 or dsa.get("index_k_norm_type") != "layernorm":
+            raise ValueError("K3.1 short-context adapter requires NoPE/LayerNorm DSA")
+        dim = dsa["index_head_dim"]
+        self.wq_b = nn.Linear(config.q_lora_rank, dsa["index_num_heads"] * dim, bias=False)
+        self.wk = nn.Linear(config.hidden_size, dim, bias=False)
+        self.k_norm = nn.LayerNorm(dim)
+        self.weights_proj = nn.Linear(config.hidden_size, dsa["index_num_heads"], bias=False)
+
+
 class KimiRuntime(MiMoRuntime):
     """Reuse source offload, checkpoint scoring and global inventory from the MiMo runtime."""
 
@@ -124,8 +159,8 @@ class KimiRuntime(MiMoRuntime):
     def __init__(self, path, *, device, dtype, rank, world_size, trust_remote_code):
         self.path = Path(path).resolve()
         self.source_config = json.loads((self.path / "config.json").read_text())
-        if self.source_config.get("model_type") != "kimi_k3":
-            raise ValueError("Kimi streaming execution requires model_type=kimi_k3")
+        if self.source_config.get("model_type") not in ("kimi_k3", "kimi_k31"):
+            raise ValueError("Kimi streaming execution requires model_type=kimi_k3 or kimi_k31")
         if not trust_remote_code:
             raise ValueError("Kimi streaming execution requires --trust-remote-code")
         self.rank, self.world_size = rank, world_size
@@ -138,6 +173,9 @@ class KimiRuntime(MiMoRuntime):
         self.reader = CheckpointReader(self.path)
         SourceDecoder(self.reader, self.source_config)
         self.modeling = _kimi_modeling(self.path)
+        self.dsa_config = self.source_config["text_config"].get("dsa_config")
+        if self.dsa_config:
+            self.loader_name = "kimi-k31-ep-streaming-short-context"
         self.model = self.build_empty(world_size)
         self.model._autoquantize_execution_device = str(self.device)
         # ModelOpt's Mixtral w1/w2/w3 rule picks ModuleList, whose forward never executes.
@@ -175,6 +213,13 @@ class KimiRuntime(MiMoRuntime):
             torch.set_default_dtype(self.dtype)
             with init_empty_weights(include_buffers=False), patch.object(self.modeling, "KimiBlockSparseMLP", local_expert):
                 model = _KimiTextModel(self.modeling.KimiLinearForCausalLM(config)).eval().requires_grad_(False)
+                if self.dsa_config:
+                    for layer in self.dsa_config["dsa_layers"]:
+                        attention = model.model.layers[layer - 1].self_attn
+                        if not isinstance(attention, self.modeling.KimiMLAAttention):
+                            raise ValueError(f"DSA layer {layer} is not an MLA layer")
+                        if not hasattr(attention, "indexer"):
+                            attention.indexer = _KimiShortContextIndexer(config).requires_grad_(False)
         finally:
             torch.set_default_dtype(original_dtype)
         # The remote model forces FlashAttention even when eager was requested.
@@ -190,6 +235,14 @@ class KimiRuntime(MiMoRuntime):
                 module.forward = module._autoquantize_ep_forward
         return model
 
+    def forward(self, model, batch):
+        if self.dsa_config:
+            tokens = batch if isinstance(batch, torch.Tensor) else batch["input_ids"]
+            if tokens.shape[-1] > self.dsa_config["index_topk"]:
+                raise ValueError("K3.1 analysis requires sequence_length <= DSA index_topk; "
+                                 "long-context sparse attention is not implemented")
+        return super().forward(model, batch)
+
     def source_key(self, name):
         if name in self.reader.headers:
             return name
@@ -199,8 +252,13 @@ class KimiRuntime(MiMoRuntime):
         raise ValueError(f"Model parameter has no source checkpoint tensor: {name}")
 
     def validate_parameters(self, model):
+        consumed = set()
+        decoder = SourceDecoder(self.reader, self.source_config)
         for name, parameter in model.named_parameters():
-            spec = self.reader.headers[self.source_key(name)]
+            source_key = self.source_key(name)
+            consumed.add(source_key)
+            consumed.update(decoder.partner_names(source_key))
+            spec = self.reader.headers[source_key]
             shape = list(spec["shape"])
             if spec["dtype"] == "U8":
                 shape[-1] *= 2
@@ -212,6 +270,31 @@ class KimiRuntime(MiMoRuntime):
                 parent, _, attr = name.rpartition(".")
                 model.get_submodule(parent)._parameters[attr] = nn.Parameter(
                     torch.empty(parameter.shape, dtype=torch.float32, device="meta"), requires_grad=False)
+        # Validate both directions: shape checks alone would silently omit new
+        # K3.1 branches, e.g. its DSA indexer. Other ranks' experts are intentional.
+        expert_ids = {int(m[2]) for name in consumed if (m := EXPERT.match(name))}
+        unexpected = []
+        for name in self.reader.headers:
+            if not name.startswith("language_model.") or name in consumed:
+                continue
+            match = EXPERT.match(name)
+            if (match and int(match[2]) < self.source_config["text_config"]["num_experts"]
+                    and int(match[2]) not in expert_ids):
+                continue
+            unexpected.append(name)
+        if unexpected:
+            raise ValueError(f"Source text tensors absent from the Kimi model: {unexpected[:10]}")
+
+    def loading_audit(self):
+        code = Path(self.modeling.__file__)
+        result = {"text_modeling_file": str(code),
+                  "text_modeling_sha256": hashlib.sha256(code.read_bytes()).hexdigest(),
+                  "baseline": "source checkpoint decoded to analysis dtype, including MXFP4 experts"}
+        if self.dsa_config:
+            result.update(dsa_execution="all causal keys fit within index_topk; dense attention is equivalent",
+                          maximum_calibration_sequence_length=self.dsa_config["index_topk"],
+                          dsa_indexer="inventoried, excluded from quantization search")
+        return result
 
     def owners(self, name):
         match = EXPERT.match(name)
@@ -235,7 +318,7 @@ class KimiRuntime(MiMoRuntime):
 
 
 def decode_source_tensor(decoder, name, weight):
-    if decoder.config.get("model_type") == "kimi_k3" and name.endswith(".self_attn.A_log"):
+    if decoder.config.get("model_type") in ("kimi_k3", "kimi_k31") and name.endswith(".self_attn.A_log"):
         heads = decoder.config["text_config"]["linear_attn_config"]["num_heads"]
         if tuple(weight.shape) == (1 << (heads - 1).bit_length(),) and weight.numel() > heads:
             # Kimi-K3 stores this vector padded to a power of two; only real heads are used.

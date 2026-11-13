@@ -8,6 +8,8 @@ Reuses the verified MiMo execution mechanisms without importing examples.
 from collections.abc import MutableMapping
 from contextlib import contextmanager
 from functools import wraps
+import os
+import time
 
 import torch
 from torch import nn
@@ -206,6 +208,7 @@ class BlockResidency:
             return
 
         self._active, self._depth = block, 1
+        started = time.monotonic()
         try:
             for module, names in self._entries[block]:
                 hook = _source_hook(module, self.decoded)
@@ -225,6 +228,10 @@ class BlockResidency:
                 hook.offload = False
             index = next(i for i, (item, _, _) in enumerate(self._blocks) if item is block)
             self.block_loads[index] += 1
+            if os.environ.get("AUTOQUANTIZE_LOG_BLOCKS") == "1":
+                print(f"[rank {os.environ.get('RANK', '0')}] block={index} "
+                      f"load={self.block_loads[index]} materialized in {time.monotonic() - started:.1f}s",
+                      flush=True)
             yield
         finally:
             self._release(block)

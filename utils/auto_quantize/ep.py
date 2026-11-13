@@ -224,6 +224,8 @@ def analyze_ep(args, policy):
                          or runtime.source_config.get("text_config", {}).get("quantization_config") or {})
                 plan["model"]["source_loading"] = {"loader": runtime.loader_name,
                     "source_quant_method": quant.get("quant_method")}
+                if hasattr(runtime, "loading_audit"):
+                    plan["model"]["source_loading"].update(runtime.loading_audit())
                 plan["execution"] = {"strategy": "expert_parallel", "world_size": world_size,
                     "experts_per_rank": runtime.experts_per_rank, "block_residency": True,
                     "block_loads_by_rank": [item["_block_loads"] for item in received],
