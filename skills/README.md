@@ -66,5 +66,5 @@ one-click-quant/                    # 本 skill 根（上库后通常为仓库�
 
 ## 相关仓库文档
 
-- 仓库根 [`README.md`](../../../README.md)
-- [`docs/`](../../../docs/)（preprocess、精度调优等）
+- 仓库根 [`README.md`](../README.md)
+- [`docs/`](../docs/)（preprocess、精度调优等）
