@@ -6,6 +6,7 @@ converters in examples/glm and examples/deepseek. No example runtime is imported
 
 from collections import Counter, OrderedDict
 import copy
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -80,6 +81,12 @@ class CheckpointReader:
         for handle in self.handles.values():
             handle.__exit__(None, None, None)
         self.handles.clear()
+
+    def fork(self):
+        """Independent mmap handles for a prefetch worker, shared immutable index."""
+        reader = copy.copy(self)
+        reader.handles = OrderedDict()
+        return reader
 
 
 def _scale_values(scale, *, exponent_bytes=False):
@@ -207,12 +214,17 @@ class SourceDecoder:
 class DecodedWeights:
     """One CPU matrix (or fused QKV) cache, never a full decoded checkpoint."""
 
-    def __init__(self, runtime):
+    def __init__(self, runtime, *, reader=None):
         self.runtime = runtime
-        self.reader = runtime.reader
+        self.reader = reader if reader is not None else runtime.reader
         self.decoder = SourceDecoder(self.reader, runtime.source_config)
         self.cached_key = None
         self.values = {}
+        self.converted = {}
+        self.gpu_decode = importlib.util.find_spec("triton") is not None
+        self.staging = None
+        self.pending_checks = []
+        self.stats = Counter()
 
     def get(self, name, shape, dtype):
         key = self.runtime.source_key(name)
@@ -224,14 +236,81 @@ class DecodedWeights:
         value = self.values[output_name]
         if tuple(value.shape) != tuple(shape):
             raise ValueError(f"Source decoded shape mismatch: {name}: {tuple(value.shape)} != {shape}")
-        value = value.to(dtype=dtype).contiguous()
-        if not torch.isfinite(value).all():
-            raise ValueError(f"Non-finite source value after conversion: {name}")
-        return value
+        cache_key = (output_name, dtype)
+        if cache_key not in self.converted:
+            value = value.to(dtype=dtype).contiguous()
+            if not torch.isfinite(value).all():
+                raise ValueError(f"Non-finite source value after conversion: {name}")
+            self.converted[cache_key] = value
+        return self.converted[cache_key]
+
+    def get_on_device(self, name, shape, dtype, device, *, defer_validation=False):
+        """Decode standard packed matrices on device; retain model-specific CPU mappings."""
+        device = torch.device(device)
+        key = self.runtime.source_key(name)
+        spec = self.reader.headers[key]
+        # Fused/transposed source layouts must still pass through their adapter.
+        direct = key == name or key == name.removesuffix(".weight") + ".weight_packed"
+        if device.type == "cuda" and self.gpu_decode and spec["dtype"] == "U8" and direct:
+            from .mxfp4_gpu import decode_mxfp4_gpu
+            from .staging import PinnedStaging
+            if (not self.decoder.packed_mxfp4
+                    and self.decoder.quant.get("store_dtype", self.decoder.quant.get("quant_method")) != "mxfp4"):
+                raise ValueError(f"{name}: packed U8 weight requires store_dtype=mxfp4")
+            if self.decoder.quant.get("mxfp4_block_size", 32) != 32:
+                raise ValueError("MXFP4 requires a 32-element block")
+            if self.staging is None:
+                self.staging = PinnedStaging(device)
+            packed = self.reader.get(key)
+            scale = self.decoder._partner(key)
+            if scale.dtype == getattr(torch, "float8_e8m0fnu", None):
+                scale = scale.view(torch.uint8)
+            value, invalid = decode_mxfp4_gpu(self.staging.copy(packed), self.staging.copy(scale), dtype)
+            if tuple(value.shape) != tuple(shape):
+                raise ValueError(f"Source decoded shape mismatch: {name}")
+            self.pending_checks.append((name, invalid))
+            self.decoder.counts["mxfp4"] += 1
+            self.stats["gpu_mxfp4_decodes"] += 1
+            if not defer_validation:
+                self.check_pending()
+            return value
+        value = self.get(name, shape, dtype)
+        self.stats["cpu_decodes_or_cache_hits"] += 1
+        if device.type == "cuda":
+            from .staging import PinnedStaging
+            if self.staging is None:
+                self.staging = PinnedStaging(device)
+            return self.staging.copy(value)
+        return value.to(device)
+
+    def check_pending(self):
+        if self.pending_checks:
+            flags = torch.stack([flag for _, flag in self.pending_checks]).cpu().tolist()
+            names = [name for (name, _), bad in zip(self.pending_checks, flags) if bad]
+            self.pending_checks.clear()
+            if names:
+                raise ValueError(f"Reserved E8M0 scale or non-finite decoded source weights: {names[:3]}")
+
+    def fork(self):
+        decoded = type(self)(self.runtime, reader=self.reader.fork())
+        decoded.gpu_decode = self.gpu_decode
+        return decoded
+
+    def close(self):
+        try:
+            self.check_pending()
+        finally:
+            if self.staging is not None:
+                self.stats["h2d_bytes"] += self.staging.bytes_copied
+                self.staging.close()
+                self.staging = None
+            self.clear()
+            self.reader.close()
 
     def clear(self):
         self.cached_key = None
         self.values.clear()
+        self.converted.clear()
 
 
 def load_model(model_path, *, device="cuda:0", dtype=torch.bfloat16, trust_remote_code=False):

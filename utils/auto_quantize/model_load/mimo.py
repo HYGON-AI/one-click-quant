@@ -151,7 +151,9 @@ class MiMoRuntime:
 
     def __enter__(self):
         attach_source_offload(self.model, self.decoded, self.device)
-        self.residency = attach_block_residency(self.model, self.decoded, self.device)
+        self.residency = attach_block_residency(self.model, self.decoded, self.device,
+                                               **getattr(self, "streaming_options", {}))
+        self.model._autoquantize_residency = self.residency
         self.resources.callback(self.residency.close)
         self.resources.enter_context(local_modelopt_state(self.model))
         register_gradient_support(self.model)
@@ -159,9 +161,11 @@ class MiMoRuntime:
 
     def __exit__(self, *exception):
         self.block_loads = dict(self.residency.block_loads)
-        self.resources.__exit__(*exception)
-        self.decoded.clear()
-        self.reader.close()
+        try:
+            self.resources.__exit__(*exception)
+        finally:
+            self.decoded.close()
+            self.streaming_stats = {"residency": dict(self.residency.stats), "loading": dict(self.decoded.stats)}
 
 
 def prepare_config(config, reader):

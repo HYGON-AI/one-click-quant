@@ -13,7 +13,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from .api import analyze_model, _calibration_metadata, validate_plan
+from .api import analyze_model, _calibration_metadata, validate_plan, sequence_sum_loss
 from .model_load import get_ep_runtime
 
 
@@ -137,7 +137,7 @@ def _bound_glibc_heap():
 
 def analyze_ep(args, policy):
     """Torchrun entry. Runtime adapters control execution; only rank zero returns a plan."""
-    from .calibration import load_calibration
+    from .calibration import load_calibration, batch_calibration
     from transformers import AutoTokenizer
 
     _bound_glibc_heap()
@@ -161,6 +161,14 @@ def analyze_ep(args, policy):
         runtime_class = get_ep_runtime(model_type)
         runtime = runtime_class(args.model, device=device, dtype=getattr(torch, args.dtype), rank=rank,
                               world_size=world_size, trust_remote_code=args.trust_remote_code)
+        decode_mode = getattr(args, "mxfp4_decode", "auto")
+        if decode_mode != "auto":
+            runtime.decoded.gpu_decode = decode_mode == "gpu"
+        runtime.streaming_options = {
+            "prefetch": bool(getattr(args, "prefetch_blocks", 0)),
+            "prefetch_budget_bytes": int(getattr(args, "prefetch_budget_gib", 16) * 1024**3),
+            "reserve_bytes": int(getattr(args, "prefetch_reserve_gib", 16) * 1024**3),
+        }
         exclude = [*policy.get("exclude", []), *args.exclude]
         include = [*policy.get("include", []), *args.include]
         grouping_rules = policy.get("grouping_rules", [])
@@ -199,12 +207,16 @@ def analyze_ep(args, policy):
                       f"searched unique weights={inventory['weight_elements']:,}; no source weights decoded or outputs written")
             return None
         batches = setup["batches"]
+        batch_size = getattr(args, "calibration_batch_size", 1)
+        local_batches = batch_calibration(batches[rank::world_size], batch_size)
         with runtime:
-            local = analyze_model(runtime.model, batches[rank::world_size], effective_bits=args.effective_bits,
+            local = analyze_model(runtime.model, local_batches, effective_bits=args.effective_bits,
                 exclude=[*exclude, *setup["excluded_modules"]], include=include, grouping_rules=grouping_rules,
                 adapter=runtime.adapter, source_config=runtime.source_config, model_id=str(Path(args.model).resolve()),
-                forward_step=runtime.forward, seed=args.seed, verbose=args.verbose, _runtime=runtime)
+                forward_step=runtime.forward, loss_func=sequence_sum_loss, seed=args.seed, verbose=args.verbose,
+                reuse_amax=getattr(args, "reuse_amax", True), _runtime=runtime)
         local["_block_loads"] = runtime.block_loads
+        local["_streaming_stats"] = runtime.streaming_stats
         received = [None] * world_size if rank == 0 else None
         if world_size > 1:
             dist.gather_object(local, received, dst=0)
@@ -216,6 +228,7 @@ def analyze_ep(args, policy):
             try:
                 plan = merge_ep_plans(received, inventory, effective_bits=args.effective_bits, owners=runtime.owners)
                 plan.pop("_block_loads", None)
+                plan.pop("_streaming_stats", None)
                 plan["calibration"] = {**_calibration_metadata(batches), "seed": args.seed,
                     "data": args.calibration_data, "requested_samples": args.calibration_samples,
                     "max_sequence_length": args.calibration_seq_length}
@@ -227,6 +240,12 @@ def analyze_ep(args, policy):
                 if hasattr(runtime, "loading_audit"):
                     plan["model"]["source_loading"].update(runtime.loading_audit())
                 plan["execution"] = {"strategy": "expert_parallel", "world_size": world_size,
+                    "calibration_batch_size_per_rank": batch_size,
+                    "scoring_steps_per_rank": len(local_batches),
+                    "mxfp4_decode": getattr(args, "mxfp4_decode", "auto"),
+                    "prefetch_blocks": getattr(args, "prefetch_blocks", 0),
+                    "streaming_stats_by_rank": [item["_streaming_stats"] for item in received],
+                    "max_calibration_by_rank": [item["optimizations"]["max_calibration"] for item in received],
                     "experts_per_rank": runtime.experts_per_rank, "block_residency": True,
                     "block_loads_by_rank": [item["_block_loads"] for item in received],
                     "gradient_loss_normalization": "sum_of_independent_sequence_mean_cross_entropies",

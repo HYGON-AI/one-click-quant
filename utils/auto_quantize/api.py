@@ -75,6 +75,20 @@ def causal_loss(logits, batch):
     return F.cross_entropy(logits[:, :-1].float().reshape(-1, logits.shape[-1]), labels.reshape(-1))
 
 
+def sequence_sum_loss(logits, batch):
+    """Preserve independent-sequence scoring when several sequences share a batch."""
+    labels = batch if isinstance(batch, torch.Tensor) else batch.get("labels", batch["input_ids"])
+    labels = labels[:, 1:].to(logits.device).clone()
+    if isinstance(batch, dict) and "attention_mask" in batch:
+        labels.masked_fill_(~batch["attention_mask"][:, 1:].to(logits.device).bool(), -100)
+    valid = (labels != -100).sum(dim=1)
+    if (valid == 0).any():
+        raise ValueError("Every calibration sequence needs a valid next-token target")
+    losses = F.cross_entropy(logits[:, :-1].float().reshape(-1, logits.shape[-1]),
+                             labels.reshape(-1), reduction="none").reshape_as(labels)
+    return (losses.sum(dim=1) / valid).sum()
+
+
 @contextmanager
 def _runtime_groups(scope):
     from modelopt.torch.quantization.algorithms import AutoQuantizeGradientSearcher
@@ -193,7 +207,7 @@ def _inventory(model, scope, adapter):
 def analyze_model(model, data_loader, *, effective_bits=4.2, exclude=(), include=(),
                   grouping_rules=(), adapter=None, source_config=None, model_id=None,
                   forward_step=None, loss_func=None, calibration=None, seed=42,
-                  output_path=None, verbose=False, _runtime=None):
+                  output_path=None, verbose=False, reuse_amax=True, _runtime=None):
     """Return a precision plan; ModelOpt converts this analysis model in place.
 
     data_loader must be repeatable or fit in memory. Default inputs/loss are for
@@ -202,6 +216,7 @@ def analyze_model(model, data_loader, *, effective_bits=4.2, exclude=(), include
     """
     import modelopt.torch.quantization as mtq
     from modelopt.torch.quantization.algorithms import AutoQuantizeGradientSearcher
+    from .max_calibration import reuse_max_calibration
 
     if output_path is not None and Path(output_path).exists():
         raise FileExistsError(f"Plan already exists: {output_path}")
@@ -250,9 +265,8 @@ def analyze_model(model, data_loader, *, effective_bits=4.2, exclude=(), include
 
         handles = [model.get_submodule(n).register_forward_hook(hook(n)) for n in active_backends]
         formats = [channel_candidate(4), channel_candidate(8)]
-        if _runtime is not None:
-            for recipe in formats:
-                recipe["algorithm"] = {"method": "max", "skip_forward_without_activation_calib": True}
+        for recipe in formats:
+            recipe["algorithm"] = {"method": "max", "skip_forward_without_activation_calib": True}
         kwargs = {}
         if "module_search_spaces" in inspect.signature(mtq.auto_quantize).parameters:
             kwargs["module_search_spaces"] = [{"module_name_patterns": ["*"],
@@ -261,7 +275,8 @@ def analyze_model(model, data_loader, *, effective_bits=4.2, exclude=(), include
         torch.manual_seed(seed)
         model.eval()
         try:
-            with _runtime_groups(scope), _cpu_scoring(model), _unbounded_fnmatch_cache():
+            with (_runtime_groups(scope), _cpu_scoring(model), _unbounded_fnmatch_cache(),
+                  reuse_max_calibration(model, enabled=reuse_amax) as calibration_stats):
                 _, state = mtq.auto_quantize(
                     model, constraints={"effective_bits": 8 if _runtime is not None else effective_bits,
                                         "cost": {"excluded_module_name_patterns": disabled}},
@@ -338,6 +353,7 @@ def analyze_model(model, data_loader, *, effective_bits=4.2, exclude=(), include
                     "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()}
         plan = {
             "schema": SCHEMA, "schema_version": 1,
+            "optimizations": {"max_calibration": dict(calibration_stats)},
             "method": "modelopt_gradient", "modelopt_version": importlib.metadata.version("nvidia-modelopt"),
             "model": identity, "module_bits": dict(sorted(module_bits.items())), "modules": modules,
             "groups": groups, "weight_parameters": weights,

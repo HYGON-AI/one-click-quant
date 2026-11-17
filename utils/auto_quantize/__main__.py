@@ -21,6 +21,18 @@ def main(argv=None):
     parser.add_argument("--calibration-data", required=True, help="txt/json/jsonl, saved HF dataset, or dataset ID")
     parser.add_argument("--calibration-samples", type=int, default=8)
     parser.add_argument("--calibration-seq-length", type=int, default=512)
+    parser.add_argument("--calibration-batch-size", type=int, default=1,
+                        help="Independent sequences per scoring batch per rank; preserves sequence-sum loss")
+    parser.add_argument("--no-reuse-amax", dest="reuse_amax", action="store_false",
+                        help="Use the original ModelOpt weight calibration loop for comparison")
+    parser.add_argument("--mxfp4-decode", choices=("auto", "cpu", "gpu"), default="auto",
+                        help="EP packed decoding: auto uses CUDA/HIP with Triton when available, otherwise CPU")
+    parser.add_argument("--prefetch-blocks", type=int, choices=(0, 1), default=0,
+                        help="EP: prepare one next block on an independent stream (double buffering)")
+    parser.add_argument("--prefetch-budget-gib", type=float, default=16,
+                        help="Maximum additional decoded block size per rank")
+    parser.add_argument("--prefetch-reserve-gib", type=float, default=16,
+                        help="Free device memory to reserve for scoring after scheduling the next block")
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--text-field")
     parser.add_argument("--effective-bits", type=float, default=4.2)
@@ -38,6 +50,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.num_threads < 1 or not math.isfinite(args.effective_bits) or not 4 <= args.effective_bits <= 8:
         parser.error("num-threads must be positive and effective-bits must be finite between 4 and 8")
+    if args.calibration_batch_size < 1 or any(not math.isfinite(x) or x < 0 for x in
+                                             (args.prefetch_budget_gib, args.prefetch_reserve_gib)):
+        parser.error("batch size must be positive; prefetch budgets must be finite and nonnegative")
+    if (args.prefetch_blocks or args.mxfp4_decode != "auto") and args.parallel != "ep":
+        parser.error("GPU streaming decode and prefetch options require --parallel ep")
+    if args.device == "cpu" and (args.mxfp4_decode == "gpu" or args.prefetch_blocks):
+        parser.error("GPU decoding/prefetch requires an accelerator device")
     if args.dry_run and args.parallel != "ep":
         parser.error("--dry-run requires --parallel ep")
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 and args.parallel != "ep":
@@ -56,8 +75,8 @@ def main(argv=None):
 
     import torch
     from transformers import AutoTokenizer
-    from .api import analyze_model, save_plan
-    from .calibration import load_calibration
+    from .api import analyze_model, save_plan, sequence_sum_loss
+    from .calibration import load_calibration, batch_calibration
     from .loading import load_model
 
     policy = json.loads(args.policy.read_text()) if args.policy else {}
@@ -81,11 +100,12 @@ def main(argv=None):
         )
         print("Source loading:", json.dumps(loading, ensure_ascii=False))
         plan = analyze_model(
-            model, batches, effective_bits=args.effective_bits,
+            model, batch_calibration(batches, args.calibration_batch_size), effective_bits=args.effective_bits,
             exclude=[*policy.get("exclude", []), *args.exclude],
             include=[*policy.get("include", []), *args.include],
             grouping_rules=policy.get("grouping_rules", []), source_config=source_config,
             model_id=str(args.model.resolve()), seed=args.seed, verbose=args.verbose,
+            loss_func=sequence_sum_loss, reuse_amax=args.reuse_amax,
             calibration={"data": args.calibration_data, "requested_samples": args.calibration_samples,
                          "max_sequence_length": args.calibration_seq_length},
         )
@@ -102,8 +122,8 @@ def main(argv=None):
     print(f"Saved {args.output}: {len(plan['module_bits'])} assigned targets, "
           f"{len(plan['excluded_modules'])} excluded, effective_bits={plan['actual_effective_bits']:.6f}")
     print(format_sensitivity_report(plan, top_k=10))
-    print(f"Full sensitivity report: {report_path}")
-    print(f"Sensitivity ranking JSON: {ranking_path}")
+    print(f"Top-10 sensitivity report: {report_path}")
+    print(f"Top-10 sensitivity ranking JSON: {ranking_path}")
     if plan["coverage"]["uncertain_groups"]:
         print("Calibration coverage needs review:", plan["coverage"]["uncertain_groups"])
     if plan["unmatched_exclusion_rules"]:
