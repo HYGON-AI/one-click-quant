@@ -4,6 +4,7 @@ import argparse
 import copy
 from datetime import timedelta
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -14,7 +15,8 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 
-from utils.auto_quantize.api import analyze_model, validate_plan
+from utils.auto_quantize.api import analyze_model, validate_plan, sequence_sum_loss
+from utils.auto_quantize.calibration import batch_calibration
 from utils.auto_quantize.ep import merge_ep_plans
 from utils.auto_quantize.model_load.kimi import (
     KimiRuntime, _KimiShortContextIndexer, _KimiTextModel, _kimi_modeling,
@@ -71,6 +73,14 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--cpu", action="store_true", help="CPU MLA/DSA path; accelerator run also tests KDA")
+    parser.add_argument("--samples-per-rank", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--no-reuse-amax", dest="reuse_amax", action="store_false")
+    parser.add_argument("--decode", choices=("cpu", "gpu"), default="gpu")
+    parser.add_argument("--prefetch", action="store_true")
+    parser.add_argument("--reference", type=Path, help="Compare global scores against a baseline result.json")
+    parser.add_argument("--score-rtol", type=float, default=0.05,
+                        help="BF16 batch/kernel arithmetic can change scores; CPU comparisons should use 1e-4")
     args = parser.parse_args()
     torch.set_num_threads(1)
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -87,6 +97,8 @@ def main():
         runtime = KimiRuntime(args.work_dir, device=device,
                               dtype=torch.float32 if args.cpu else torch.bfloat16,
                               rank=rank, world_size=world, trust_remote_code=True)
+        runtime.decoded.gpu_decode = args.decode == "gpu"
+        runtime.streaming_options = {"prefetch": args.prefetch}
         inventory = runtime.global_inventory(exclude=[], include=[], grouping_rules=[]) if rank == 0 else None
         # Reject a length for which dense DSA would cease to be equivalent.
         try:
@@ -96,13 +108,21 @@ def main():
         else:
             raise AssertionError("Long DSA sequence was not rejected")
         torch.manual_seed(42 + rank)
-        batch = torch.randint(1, 128, (1, 16))
+        batches = [torch.randint(1, 128, (1, 16)) for _ in range(args.samples_per_rank)]
+        batches = batch_calibration(batches, args.batch_size)
         with runtime:
-            local = analyze_model(runtime.model, [batch], effective_bits=4.2, adapter=runtime.adapter,
+            local = analyze_model(runtime.model, batches, effective_bits=4.2, adapter=runtime.adapter,
                                   source_config=runtime.source_config, forward_step=runtime.forward,
-                                  _runtime=runtime)
-        assert all(n >= 2 for n in runtime.block_loads.values()), runtime.block_loads
+                                  loss_func=sequence_sum_loss, reuse_amax=args.reuse_amax, _runtime=runtime)
+        assert all(n == 2 * len(batches) for n in runtime.block_loads.values()), runtime.block_loads
         assert all(p.is_meta for p in runtime.model.parameters()), "Source parameters remained resident"
+        if args.reuse_amax:
+            stats = local["optimizations"]["max_calibration"]
+            assert stats["weights_calibrated"] == len(local["module_bits"]), stats
+            assert stats["amax_reused"] == len(local["module_bits"]), stats
+        if args.prefetch:
+            assert runtime.streaming_stats["residency"].get("prefetch_hits", 0) == 6 * len(batches)
+            assert runtime.residency._pending is None
         received = [None] * world if rank == 0 else None
         if world > 1:
             dist.gather_object(local, received, dst=0)
@@ -120,7 +140,21 @@ def main():
                        "searched_modules": len(plan["module_bits"]), "groups": len(searched),
                        "actual_effective_bits": plan["actual_effective_bits"],
                        "block_loads": runtime.block_loads,
+                       "optimizations": local["optimizations"], "streaming": runtime.streaming_stats,
                        "scores": {k: v["scores"] for k, v in plan["groups"].items() if v["status"] == "searched"}}
+            if not args.cpu:
+                summary["peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+            if args.reference:
+                reference = json.loads(args.reference.read_text())
+                assert reference["actual_effective_bits"] == summary["actual_effective_bits"]
+                assert reference["searched_modules"] == summary["searched_modules"]
+                relative = []
+                for group, scores in summary["scores"].items():
+                    for bit, score in scores.items():
+                        expected = reference["scores"][group][bit]
+                        assert math.isclose(score, expected, rel_tol=args.score_rtol, abs_tol=1e-15), (group, bit, score, expected)
+                        relative.append(abs(score - expected) / max(abs(expected), 1e-30))
+                summary["max_relative_score_difference"] = max(relative)
             (args.work_dir / "result.json").write_text(json.dumps(summary, indent=2))
             print("SMOKE PASSED:", json.dumps(summary), flush=True)
     finally:

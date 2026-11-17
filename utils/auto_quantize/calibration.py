@@ -6,6 +6,46 @@ from pathlib import Path
 import torch
 
 
+def batch_calibration(batches, batch_size=1):
+    """Merge independent sequences along batch dimension, never concatenate tokens.
+
+    Right padding gets both an attention mask and ignored labels. All ranks
+    retain ceil(sequence_count / batch_size) steps, including a final short batch.
+    """
+    if batch_size < 1:
+        raise ValueError("calibration batch size must be positive")
+    batches = list(batches)
+    if batch_size == 1:
+        return batches
+    sequences = []
+    for batch in batches:
+        data = {"input_ids": batch} if isinstance(batch, torch.Tensor) else batch
+        if set(data) - {"input_ids", "attention_mask", "labels"}:
+            raise ValueError("Batch merging supports input_ids, attention_mask and labels only")
+        ids = data["input_ids"]
+        if ids.ndim != 2:
+            raise ValueError("Calibration input_ids must have shape [batch, sequence]")
+        mask = data.get("attention_mask", torch.ones_like(ids))
+        labels = data.get("labels", ids)
+        if mask.shape != ids.shape or labels.shape != ids.shape:
+            raise ValueError("Calibration masks/labels must match input_ids")
+        sequences.extend(zip(ids, mask, labels))
+    result = []
+    for start in range(0, len(sequences), batch_size):
+        group = sequences[start:start + batch_size]
+        length = max(ids.numel() for ids, _, _ in group)
+        ids = torch.zeros((len(group), length), dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        labels = torch.full_like(ids, -100)
+        for row, (tokens, valid, target) in enumerate(group):
+            size = tokens.numel()
+            ids[row, :size] = tokens.cpu()
+            mask[row, :size] = valid.cpu()
+            labels[row, :size] = target.cpu().masked_fill(~valid.cpu().bool(), -100)
+        result.append({"input_ids": ids, "attention_mask": mask, "labels": labels})
+    return result
+
+
 def _text(record, tokenizer, text_field=None):
     if isinstance(record, str):
         return record
