@@ -222,8 +222,50 @@ python3 -m utils.torch_infer --model <产物目录> --no-dispatch
 
 回退路径只证明"能加载、能生成、无明显退化"，**不能替代 PPL 数值结论**，报告里要写清楚用的是哪条路径。
 
+### 4.2 精度对比报告（ΔPPL / ΔNLL，无阈值）
+
+做完产物契约（§1）与 dtype（§2）之后，若要做精度验证，按下面流程出**对比报告**。
+**不对 ΔPPL / ΔNLL 设阈值，也不因 Δ 大小判 PASS/FAIL**；硬门禁仍只在契约 / dtype。
+
+| 符号 | 定义 |
+|------|------|
+| PPL | lm_eval wikitext 表格里的 `word_perplexity` |
+| `PPL_b` / `PPL_q` | baseline / 量化产物的 word_perplexity |
+| ΔPPL | `PPL_q − PPL_b` |
+| ΔNLL | `ln(PPL_q) − ln(PPL_b)`（nats） |
+
+**完成精度验证的最低交付**：四个数都要有 —— `PPL_b`、`PPL_q`、`ΔPPL`、`ΔNLL`。只报单侧 PPL 不算完成。
+
+Agent 流程：
+
+1. `python3 ./skills/scripts/check_artifact.py <产物目录>` 退出码 0
+2. 确认 `HF_DATASETS_CACHE`（默认 `./datasets`）下存在 `EleutherAI___wikitext_document_level`
+3. 对 **baseline** 与 **产物** 各跑一次 `--lm-eval`（同一 `tasks=wikitext`、同一离线缓存；
+   `tensor_parallel_size` / `dtype` / `gpu_memory_utilization` 尽量一致），从输出表摘 `word_perplexity`
+4. 用脚本算差并打印（脚本**不**跑评测、**不**设阈值）：
+
+```bash
+# baseline / 产物各跑一次；pretrained= 换成真实目录
+python3 main.py --lm-eval "pretrained=<baseline>,tensor_parallel_size=2,dtype=auto,gpu_memory_utilization=0.6"
+python3 main.py --lm-eval "pretrained=<产物>,tensor_parallel_size=2,dtype=auto,gpu_memory_utilization=0.6"
+
+python3 ./skills/scripts/report_ppl_delta.py \
+  --baseline-ppl <PPL_b> --quant-ppl <PPL_q>
+```
+
+报告模板（可原样贴给客户）：
+
+```text
+PPL_b   = <baseline word_perplexity>
+PPL_q   = <quant word_perplexity>
+ΔPPL    = PPL_q - PPL_b
+ΔNLL    = ln(PPL_q) - ln(PPL_b)   # nats
+```
+
+客户问「是否达标」时：说明本 skill **无 Δ 阈值门禁**，只提供数值；若要排查涨点，再进 `05-precision-debug.md`。
+
 ## 5. 评测对比基线的纪律
 
-- 对比必须是**同结构同层数**的 BF16 源，不能拿全量模型 PPL 去比 mini 产物
-- 结论必须给出两个数：基线与产物的指标 + 差值；只给一个数等于没结论
-- PPL 涨点先看阶段5 `05-precision-debug.md` 的阶梯，不要直接改方案
+- 对比必须是**同结构同层数**的 BF16 源（或同结构预处理浮点），不能拿全量模型 PPL 去比 mini 产物
+- 精度结论必须给出 §4.2 的四个数；缺任一等于没结论
+- **不对 ΔPPL / ΔNLL 设阈值**；涨点排查走阶段5 `05-precision-debug.md`，不要直接改方案

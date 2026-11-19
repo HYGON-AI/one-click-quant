@@ -1,6 +1,6 @@
 # one-click-quant Skill
 
-Agent 入口是 [`SKILL.md`](SKILL.md)。本文提供：能力边界、已适配路径与可复现测试步骤。
+Agent 入口是 [`SKILL.md`](SKILL.md)。本文给人看：能力边界、已适配路径与可复现测试步骤。
 
 ## Summary
 
@@ -11,13 +11,18 @@ Skill 不新增量化算法，只文档化仓库**已有**能力；参数与原�
 
 ### Skill 能做什么
 
+- **任意模型入口**（`references/00-new-model-playbook.md`）：先判是否已适配
+  - 已适配 → 给出已适配方案菜单供选择；客户自提方案 → 评估是否可行（不可行则给替代）
+  - 未适配 → 取证 → 可行列表 → 是否 preprocess → 主推荐（确认后再执行/适配）
 - 引导 Agent 走完整闭环：环境 → 模型准备 → 选路径量化 → 验收 → 精度排查
 - 按模型族指向正确入口（通用 scheme / 定制 scheme / preprocess / slimquant / MoE-Quant / examples）
 - 用 `check_recipe.py` / `check_artifact.py` 做静态门禁；约束假路径、相对路径、红线
 
 ### Skill / 本仓库明确不保证什么
 
-- 不保证「任意 HF 模型开箱即用」；未在下表出现的模型需自行加 adapter / scheme / examples
+- 不保证「任意 HF 模型开箱即用」；未适配先走 `00` 出方案，再按需加 adapter / scheme / examples
+- 「已适配」只表示有专用入口，不表示客户自提的任意组合都合法（需经 `00` 阶段 U 评估）
+- `00` 的推荐/评估是**工程可行结论**，不等于精度承诺；精度对比见 `04` §4.2（展示 ΔPPL / ΔNLL，**无阈值门禁**）
 - 不做集群调度、账号下载、vLLM 运维压测
 - 非 bug 不改 absorb / pipeline / transform / quant_templates 核心逻辑
 - Skill 文档与命令以当前仓库代码为准；下表「适配」= **代码里有专用入口**，不等于本次 PR 对全量表做了端到端重跑
@@ -87,26 +92,38 @@ Skill 不新增量化算法，只文档化仓库**已有**能力；参数与原�
 | `examples/glm/build_mini_glm5_3.py` | GLM-5.3 |
 | `examples/kimi/build_mini_kimi_k3.py` | Kimi-K3 |
 
-## 测试步骤（按「适配路径」复现）
+## 模型入口（先判适配 / 只出方案）
 
-原则：选上表中**一条已适配路径**，用对应真实权重目录复现（**对于未适配模型，请谨慎使用**）。
+向 agent 描述示例：
 
-> 比如：
->
-> 向 agent 描述：
->
-> 1. 用镜像 `10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk26041-py3.10-20261102-0242` 创建容器，用 one-click-quant 对 `/public/opendas/DL_DATA/llm-models/Qwen3.8-Flash-Next` 做已适配的 preprocess（recipe: `qwen3_8_flash_next`）。量化完的权重保存到当前工程目录，按 preprocess 标准验收。
->    即可在当前工程目录得到预处理后的权重。另外，如果有可用的容器，或已在容器环境中，就无需重新创建容器。
-> 2. 用 one-click-quant 对 `.../outputs/Qwen3.8-Flash-Next-preprocessed` 做 `slimquant_ptq` W4A8 量化（加 `--from-preprocessed` 与 Flash-Next 必要 ignore：`re:.*conv1d.*`、`re:.*norm.*`、`re:.*visual.*`），产物写到工程 `outputs/`，按 `slimquant_w4a8` 契约验收。
->    即可在当前工程目录得到量化后的 slimquant 格式权重。
-> 3. 用 one-click-quant 将 `/public4/opendas/DL_DATA/llm-models/deepseek-ai/DeepSeek-V4.1-Flash` 量化为 compressed-tensors 格式的 W4A8，量化完的权重放在当前 `outputs` 目录下，用 compressed-tensors 格式验收。
->    即可在当前工程目录得到量化后的 compressed-tensors 格式权重。
-> 4. 用 one-click-quant 的 `--analysis outlier` 功能对 `/public/opendas/DL_DATA/llm-models/Qwen3.8-Flash-Next` 做敏感度分析，并给出敏感度分析报告。
->    即可在当前工程目录得到敏感度分析报告。
-> 5. 用 one-click-quant 中的 preprocess 对 `/public/opendas/DL_DATA/llm-models/Qwen/Qwen2-57B-A14B-Instruct` 做预处理，目前还未适配该模型的预处理功能，可以先适配，再运行，预处理后的权重保存到 `/module` 目录下。
->    即可完成对 Qwen2-57B-A14B-Instruct 的 preprocess 适配，并在 `/module` 得到预处理后的权重 `Qwen2-57B-A14B-Instruct-preprocessed`。
-> 6. 用 one-click-quant 的 MoE-Quant 对 `/public/opendas/DL_DATA/llm-models/Qwen/Qwen2-57B-A14B-Instruct` 做 W8A8 GPTQ 量化，量化完的模型放在目录 `/module` 下。
->    即可得到权重 `/module/Qwen2-57B-A14B-Instruct-MOE-Quant-W8A8`（GPTQ 中间产物）；HF 打包目录一般为 `/module/Qwen2-57B-A14B-Instruct-W8A8`（`pack_quantized_model.py --activation-bits 8`）。
+> 读取 `<模型绝对路径>`，按 `00-new-model-playbook`：先判断是否已适配；若已适配，列出已适配方案供我选择；若我另行提出方案，请评估是否可行。若未适配，按新模型流程给出可行方案、是否 preprocess 与主推荐。先不要执行量化。
+
+## 测试demo
+
+如果不了解模型，也不知道怎么量化，可以给agent输入模型路径，让它制定合适的量化方案。
+1. /public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-VL-72B-Instruct，这个模型在one-click-quant中是否已经适配，若已适配，请给出量化方案。若未适配，请推荐合适的量化方案。
+
+如果明确知道怎么量化，可以借鉴下面的例子：
+1. 明确使用镜像或有可用的容器，或已在容器环境中，就无需重新创建容器\
+用镜像10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk26041-py3.10-20261102-0242创建容器，用 one-click-quant对/public/opendas/DL_DATA/llm-models/Qwen3.8-Flash-Next做已适配的 preprocess（recipe: qwen3_8_flash_next）。量化完的权重保存到当前工程目录，按 preprocess 标准验收。
+
+2. 对preprocess后的权重做slimquant_ptq W4A8\
+用 one-click-quant对 .../outputs/Qwen3.8-Flash-Next-preprocessed 做 slimquant_ptq W4A8量化（加 --from-preprocessed 与 Flash-Next 必要 ignore：re:.*conv1d.*、re:.*norm.*、re:.*visual.*），产物写到工程 outputs/，按 slimquant_w4a8 契约验收。
+
+3. 量化为compressed-tensors 格式的 W4A8\
+用one-click-quant将/public4/opendas/DL_DATA/llm-models/deepseek-ai/DeepSeek-V4.1-Flash量化为 compressed-tensors 格式的 W4A8，量化完的权重放在当前outputs目录下，用compressed-tensors格式验收。
+
+4. 对模型做敏感度分析\
+用one-click-quant的--analysis outlier功能对/public/opendas/DL_DATA/llm-models/Qwen3.8-Flash-Next做敏感度分析，并给出敏感度分析报告.
+
+5. 为preprocess适配新的模型\
+用one-click-quant中的preprocess对/public/opendas/DL_DATA/llm-models/Qwen/Qwen2-57B-A14B-Instruct做预处理，目前还未适配该模型的预处理功能，可以先适配，再运行，预处理后的权重保存到/module目录下.
+
+6. 对未适配的新模型做w8a8 GPTQ量化\
+用one-click-quant的Moe-Quant对/public/opendas/DL_DATA/llm-models/Qwen/Qwen2-57B-A14B-Instruct做w8a8 GPTQ量化，量化完的模型放在目录/module下。
+
+7. 量化完做精度验证\
+用one-click-quant的Moe-Quant对/public/opendas/DL_DATA/llm-models/Qwen/Qwen2-57B-A14B-Instruct做w8a8 GPTQ量化，量化完的模型放在目录/module下。并对量化后的模型做精度验证，给出精度报告。
 
 ## 目录结构
 
@@ -115,10 +132,11 @@ skills/                             # 本 skill 根（上库后通常为仓库�
 ├── SKILL.md                        # 路由 + 门禁四件套（硬门禁 / 红线 / 检查清单 / 通过标准）
 ├── README.md                       # 本说明
 ├── references/
+│   ├── 00-new-model-playbook.md    # 模型入口：判适配 → 已适配菜单/自提评估 → 未适配推荐
 │   ├── 01-env-docker.md            # 阶段1 环境 / 镜像 / 依赖 / 数据集
 │   ├── 02-model-prep.md            # 阶段2 权重取证 / mini / 解包
 │   ├── 03-quant-runbook.md         # 阶段3 选 scheme/alg、跑量化
-│   ├── 04-verify-eval.md           # 阶段4 产物契约 / dtype / MSE / PPL / torch_infer
+│   ├── 04-verify-eval.md           # 阶段4 产物契约 / dtype / MSE / PPL(ΔPPL/ΔNLL) / torch_infer
 │   ├── 05-precision-debug.md       # 阶段5 精度排查阶梯
 │   ├── 10-ext-preprocess.md        # 扩展：preprocess adapter + recipe
 │   ├── 11-ext-scheme.md            # 扩展：scheme / quant_templates
@@ -129,14 +147,15 @@ skills/                             # 本 skill 根（上库后通常为仓库�
 │   └── experiences.md              # 横切经验条目（E-xx，不占编号）
 └── scripts/
     ├── check_recipe.py             # 静态校验 preprocess recipe
-    └── check_artifact.py           # 静态校验量化产物（不适用于 preprocess 浮点目录）
+    ├── check_artifact.py           # 静态校验量化产物（不适用于 preprocess 浮点目录）
+    └── report_ppl_delta.py         # 由两侧 word_perplexity 打印 ΔPPL / ΔNLL（无阈值）
 ```
 
 ### 编号约定
 
 | 前缀 | 含义 | 范围 |
 |------|------|------|
-| `0x` | 生命周期阶段 | `01` → `05`（从零到可用） |
+| `0x` | 生命周期阶段 | `00` 新模型方案；`01` → `05` 从零到可用 |
 | `1x` | 扩展点 | `10` → `13`（改能力） |
 | `2x` | 知识层 | `20` → `21`（查细节） |
 

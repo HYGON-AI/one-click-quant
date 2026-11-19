@@ -4,6 +4,9 @@
 > `python3 main.py --help`、仓库根 `README.md`（含「常见故障排查」）、`utils/MoE-Quant/README.md`、
 > `templates/quant_templates.yaml`。
 > 本文只写**路径怎么选、命令怎么写、哪些是坑**。
+>
+> **方案未定**：先走 [00-new-model-playbook.md](00-new-model-playbook.md)（判适配 / 菜单 / 自提评估 / 未适配推荐）
+> 让客户确认主方案，再回到本文写具体命令。未确认前不要擅自选定 `--alg` / `--scheme` 开跑。
 
 ## 1. 路径选择
 
@@ -277,15 +280,16 @@ python3 pack_quantized_model.py \
 不要直接报"完成"。先过 `references/04-verify-eval.md` 的产物契约与 dtype 校验，
 再做 PPL / 推理对比。方案与产物 dtype 不符时，回查 `--ignore` 与 `targets`。
 
-PPL 命令：
+PPL 命令（baseline 与产物各跑一次，摘 `word_perplexity` 后算差，见 `04` §4.2）：
 
 ```bash
 python3 main.py --lm-eval "pretrained=$SAVE,tensor_parallel_size=2,dtype=auto,gpu_memory_utilization=0.6"
+python3 ./skills/scripts/report_ppl_delta.py --baseline-ppl <PPL_b> --quant-ppl <PPL_q>
 ```
 
 OOM → 降 `gpu_memory_utilization`；vLLM 不可用时改用 `utils/torch_infer.py`（见 `04-verify-eval.md`）。
 `--lm-eval` 强制离线且要求本地已有 wikitext 缓存，缺数据集会直接退出 —— 先读 `04-verify-eval.md` 第 4 节
-的前置条件，不要把它当成"多试几次就能过"。
+的前置条件，不要把它当成"多试几次就能过"。ΔPPL / ΔNLL **无阈值**，只展示。
 
 ## 7. examples 索引
 
