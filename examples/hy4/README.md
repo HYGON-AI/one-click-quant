@@ -8,3 +8,18 @@
     --int8-mlp --int8-mla --int8-indexer-wq-b --int8-indexer-wk
 ```
 
+### Hy4-flash-Channel-FP8-w8a8
+
+```bash
+  python3 quantize_hy4_flash_fp8_channel.py --input-dir /models/Hy4-flash --output-dir /models/Hy4-flash-channel-fp8
+```
+
+### Hy4-flash-Channel-INT4-w4a8
+
+```bash
+  python quantize_hy4_flash_mixed_int4_int8.py \
+    --input-dir /models/Hy4-flash \
+    --output-dir /models/Hy4-flash-Channel-INT4-w4a8 \
+    --int8-attn --int8-linear-gate --int8-dense-mlp --int8-shared-experts
+```
+
